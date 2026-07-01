@@ -1,0 +1,17 @@
+# 装好 Docker 后：cd docker && docker compose up -d
+# 随后 python -m product_mapper.ingest_pg，再把 .env 里 RECALL_BACKEND 改为 pg
+services:
+  pgvector:
+    image: pgvector/pgvector:pg16
+    container_name: taxonomy_pg
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: taxonomy
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:

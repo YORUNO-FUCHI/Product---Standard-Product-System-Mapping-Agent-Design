@@ -1,0 +1,11 @@
+# ── 必需（你的环境已全部具备，零新增安装即可运行内存后端）──
+numpy
+openpyxl
+requests
+python-dotenv
+
+# ── 可选：切换到本地语义向量（EMBEDDER=st）──
+# sentence-transformers
+
+# ── 可选：切换到 Postgres 后端（RECALL_BACKEND=pg）──
+# psycopg[binary]
