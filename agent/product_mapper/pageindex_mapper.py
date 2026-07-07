@@ -83,9 +83,15 @@ class PageIndexMapper:
 
         # 预计算节点 trigram 集合（用于快速相似度计算）
         self._node_trigrams: dict[int, set] = {}
+        self._node_name_trigrams: dict[int, set] = {}
         for n in self.nodes:
             from .text import trigrams
             self._node_trigrams[n.id] = trigrams(n.search_text())
+            names = [n.name] + n.synonyms
+            tset = set()
+            for name in names:
+                tset |= trigrams(name)
+            self._node_name_trigrams[n.id] = tset
 
     def _get_children(self, node_id: int) -> list:
         """获取某节点的子节点列表（按名称排序）。"""
@@ -299,22 +305,26 @@ class PageIndexMapper:
         }
 
     def _fallback_trigram(self, product: str, t0: float) -> dict:
-        """无 LLM 时的 trigram 降级方案：全量节点匹配 Top-1。"""
+        """无 LLM 时的候选式降级方案：全量节点匹配 Top-1。
+
+        返回弱匹配而不是直接置空，便于实验表观察 Route B 的候选覆盖能力。
+        """
         from .text import trigrams as get_trigrams
         prod_tri = get_trigrams(product)
+        boosted_product = _fallback_alias(product)
+        boosted_tri = get_trigrams(boosted_product)
         best_node, best_score = None, 0.0
         for n in self.nodes:
-            node_tri = self._node_trigrams.get(n.id, set())
-            if not prod_tri or not node_tri:
-                score = 0.0
-            else:
-                inter = len(prod_tri & node_tri)
-                score = inter / len(prod_tri | node_tri) if inter > 0 else 0.0
+            score = _jaccard(prod_tri, self._node_name_trigrams.get(n.id, set()))
+            score = max(score, _jaccard(prod_tri, self._node_trigrams.get(n.id, set())) * 0.85)
+            if boosted_product != product:
+                score = max(score, _jaccard(boosted_tri, self._node_name_trigrams.get(n.id, set())) * 0.95)
+                score = max(score, _jaccard(boosted_tri, self._node_trigrams.get(n.id, set())) * 0.80)
             if score > best_score:
                 best_score = score
                 best_node = n
 
-        if best_node and best_score > 0.3:
+        if best_node and best_score >= 0.18:
             return {
                 "product": product,
                 "node_id": best_node.id,
@@ -325,6 +335,20 @@ class PageIndexMapper:
                 "source": "pageindex_trigram",
                 "latency_ms": round((time.time() - t0) * 1000, 1),
                 "trace": [],
+            }
+
+        if best_node and best_score >= 0.08:
+            return {
+                "product": product,
+                "node_id": best_node.id,
+                "name": best_node.name,
+                "path": best_node.path_str,
+                "confidence": round(best_score, 3),
+                "reason": "Route B 弱匹配候选（无 LLM，需人工复核）",
+                "source": "pageindex_trigram_weak",
+                "latency_ms": round((time.time() - t0) * 1000, 1),
+                "trace": [],
+                "weak_match": True,
             }
 
         return {
@@ -338,6 +362,25 @@ class PageIndexMapper:
             "latency_ms": round((time.time() - t0) * 1000, 1),
             "trace": [],
         }
+
+
+def _jaccard(a: set, b: set) -> float:
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    return inter / len(a | b) if inter else 0.0
+
+
+def _fallback_alias(product: str) -> str:
+    """Map common long product suffixes to broader taxonomy-friendly terms."""
+    p = product.strip()
+    if any(x in p for x in ("测定试剂盒", "检测试剂盒", "诊断试剂盒", "试剂盒")):
+        return "生物试剂盒"
+    if any(x in p for x in ("水质检测仪", "水质测试仪", "检测仪", "测试仪", "监测仪")):
+        return "测试仪器"
+    if any(x in p for x in ("比色计", "分析仪")):
+        return "分析仪器"
+    return p
 
 
 # ── 模块入口 ───────────────────────────────────────────────────────
