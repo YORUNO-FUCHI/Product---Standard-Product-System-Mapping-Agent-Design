@@ -27,16 +27,18 @@ class Candidate:
 
 
 class MemoryRecall:
-    def __init__(self, nodes):
+    def __init__(self, nodes, embedder_type: str = None):
         self.nodes = nodes
-        self.embedder = get_embedder()
+        self.embedder_type = embedder_type or config.EMBEDDER
+        self.embedder = get_embedder(self.embedder_type)
+        self._emb_cache = {}  # embedder_type → (embedder, emb_matrix)
         self._build()
 
     def _build(self):
         t0 = time.time()
-        # 每个节点的字面文本集合（名称 + 同义词），及其 trigram 集合
-        self._node_trisets = []      # index -> set(trigram)
-        self._inverted = defaultdict(list)  # trigram -> [node_index]
+        # trigram 倒排索引（和 embedder 无关，只建一次）
+        self._node_trisets = []
+        self._inverted = defaultdict(list)
         for i, n in enumerate(self.nodes):
             names = [n.name] + n.synonyms
             tset = set()
@@ -48,8 +50,23 @@ class MemoryRecall:
 
         # 向量矩阵
         texts = [n.search_text() for n in self.nodes]
-        self._emb = self.embedder.encode(texts)   # (N, dim)，已 L2 归一化
+        self._emb = self.embedder.encode(texts)
         self.build_seconds = time.time() - t0
+
+    def rebuild(self, embedder_type: str):
+        """切换 embedder 并重建向量矩阵（优先用预计算缓存）。"""
+        if embedder_type == self.embedder_type:
+            return 0
+        t0 = time.time()
+        self.embedder_type = embedder_type
+
+        if embedder_type in self._emb_cache:
+            self.embedder, self._emb = self._emb_cache[embedder_type]
+        else:
+            self.embedder = get_embedder(embedder_type)
+            texts = [n.search_text() for n in self.nodes]
+            self._emb = self.embedder.encode(texts)
+        return time.time() - t0
 
     # ── 字面召回 ────────────────────────────────────────────────
     def _recall_trgm(self, query, k):

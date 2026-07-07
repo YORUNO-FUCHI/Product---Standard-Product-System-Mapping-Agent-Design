@@ -33,7 +33,8 @@ def chat_json(system: str, user: str, temperature: float = 0.0, timeout: int = 6
         "response_format": {"type": "json_object"},
     }
     try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
+        resp = requests.post(url, headers=headers, json=payload, timeout=timeout,
+                             proxies={"http": None, "https": None})
         resp.raise_for_status()
         content = resp.json()["choices"][0]["message"]["content"]
         return _safe_json(content)
