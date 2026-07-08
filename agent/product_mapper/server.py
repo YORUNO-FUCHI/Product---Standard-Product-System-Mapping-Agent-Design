@@ -5,11 +5,17 @@
 运行：  python -m product_mapper.server
 然后浏览器打开：  http://localhost:8000
 """
+import base64
 import json
+import threading
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 from . import config
 from .agent import ProductMapper
+from .batch import BatchJob, process_batch
 from .embedder import st_available
 from .extension import append_extension_record, route_a_reliable, route_b_reliable, suggest_extension
 from .pageindex_mapper import PageIndexMapper
@@ -18,6 +24,9 @@ MAPPER = None         # Route A
 PI_MAPPER = None      # Route B
 CURRENT_EMBEDDER = None
 CURRENT_METHOD = "raga"  # "raga" | "pageindex" | "hybrid"
+BATCH_JOBS = {}
+BATCH_LOCK = threading.Lock()
+BATCH_DIR = config.CACHE_DIR / "batch_jobs"
 
 PAGE = r"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
@@ -75,7 +84,19 @@ PAGE = r"""<!DOCTYPE html>
  .extension{border-color:#f59e0b;background:#221a10}
  .kv{display:grid;grid-template-columns:120px 1fr;gap:8px 14px;margin-top:14px;font-size:13px}
  .kv .k{color:#94a3b8}.kv .v{color:#e2e8f0}
+ .batch-panel{margin-top:28px}
+ .batch-controls{display:grid;grid-template-columns:1.4fr 1fr .8fr auto;gap:10px;align-items:end}
+ .field label{display:block;font-size:12px;color:#94a3b8;margin-bottom:6px}
+ .field input,.field select{width:100%;padding:10px 12px;border-radius:8px;border:1px solid #334155;background:#0f172a;color:#e2e8f0}
+ .progress{height:10px;background:#334155;border-radius:999px;overflow:hidden;margin-top:12px}
+ .progress>i{display:block;height:100%;width:0;background:linear-gradient(90deg,#6366f1,#22c55e)}
+ .summary{display:flex;gap:12px;flex-wrap:wrap;margin-top:12px;font-size:13px;color:#cbd5e1}
+ .summary span{background:#0f172a;border:1px solid #334155;border-radius:8px;padding:6px 10px}
+ .download{display:none;margin-top:12px}
+ .preview-wrap{max-height:360px;overflow:auto;margin-top:12px}
+ .preview-wrap table{min-width:980px}
  @media(max-width:760px){.flow{grid-template-columns:1fr}.grid{grid-template-columns:1fr}.bar{flex-direction:column}.kv{grid-template-columns:1fr}}
+ @media(max-width:900px){.batch-controls{grid-template-columns:1fr}}
 </style></head><body><div class="wrap">
  <h1>产品 - 标准产品体系映射智能体</h1>
  <div class="sub" id="subtitle">双路召回（trigram + 向量）→ 融合 + LLM 精排 → 唯一标准节点</div>
@@ -108,6 +129,36 @@ PAGE = r"""<!DOCTYPE html>
  <div class="chips" id="chips"></div>
  <div class="load" id="load">[加载中] 正在匹配…</div>
  <div id="out"></div>
+
+ <div class="card batch-panel">
+   <h3>批量导入处理</h3>
+   <div class="desc">上传 Excel 后批量执行 Route A / Route B / Hybrid，并生成可下载结果表。</div>
+   <div class="batch-controls">
+     <div class="field">
+       <label>Excel 文件（.xlsx）</label>
+       <input id="batchFile" type="file" accept=".xlsx">
+     </div>
+     <div class="field">
+       <label>处理模式</label>
+       <select id="batchMode">
+         <option value="local" selected>本地低成本</option>
+         <option value="full">Hybrid完整演示</option>
+         <option value="sampled">抽样LLM</option>
+       </select>
+     </div>
+     <div class="field">
+       <label>最大处理条数</label>
+       <input id="batchLimit" type="number" min="1" max="5000" value="200">
+     </div>
+     <button id="batchStart" onclick="startBatch()">开始批量处理</button>
+   </div>
+   <div class="progress"><i id="batchBar"></i></div>
+   <div class="summary" id="batchSummary">
+     <span>状态：等待上传</span>
+   </div>
+   <button class="download" id="batchDownload" onclick="downloadBatch()">下载结果 Excel</button>
+   <div class="preview-wrap" id="batchPreview"></div>
+ </div>
 </div>
 <script>
 const SAMPLES=["苞米","独头蒜","Vigna radiata","红富士苹果","笔记本电脑","工业机器人","华为Matebook X Pro","大疆无人机Mavic 3","特斯拉Model 3电池包","XYZ999999","火星地产会员卡"];
@@ -122,7 +173,7 @@ let currentMethod='raga';
 const methodDescs = {
   'raga': 'Route A：双路召回（trigram 字面 + 向量语义）→ 多策略融合 + DeepSeek 精排 → 唯一标准节点',
   'pageindex': 'Route B：LLM 在标准体系树上逐层推理搜索（PageIndex 式），无向量依赖，完整可追溯路径',
-  'hybrid': 'Hybrid：Route A 召回先试 → 低置信度或无结果时自动 fallback 到 Route B 树搜索',
+  'hybrid': 'Hybrid：同时展示 Route A 与 Route B 判断；双路线都不可靠时进入体系扩展建议',
 };
 
 async function getState(){try{const r=await fetch('/api/state');const d=await r.json();currentEmb=d.embedder;currentMethod=d.method;updateMethodBtns();updateEmbBtns();updateEmbedderRow()}catch(e){}}
@@ -342,6 +393,100 @@ function renderPageIndex(d){
   }
   document.getElementById('out').innerHTML=card+traceHtml;
 }
+
+let currentBatchJob=null;
+let batchTimer=null;
+
+function fileToBase64(file){
+  return new Promise((resolve,reject)=>{
+    const reader=new FileReader();
+    reader.onload=()=>{
+      const data=String(reader.result||'');
+      resolve(data.includes(',')?data.split(',')[1]:data);
+    };
+    reader.onerror=()=>reject(reader.error);
+    reader.readAsDataURL(file);
+  });
+}
+
+async function startBatch(){
+  const file=document.getElementById('batchFile').files[0];
+  const btn=document.getElementById('batchStart');
+  if(!file){renderBatchMessage('请选择一个 .xlsx 文件');return}
+  if(!file.name.toLowerCase().endsWith('.xlsx')){renderBatchMessage('当前只支持 .xlsx 文件');return}
+  btn.disabled=true;
+  renderBatchMessage('正在上传文件…');
+  try{
+    const data=await fileToBase64(file);
+    const payload={
+      filename:file.name,
+      data_base64:data,
+      mode:document.getElementById('batchMode').value,
+      limit:Number(document.getElementById('batchLimit').value||200)
+    };
+    const r=await fetch('/api/batch/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const d=await r.json();
+    if(d.error){renderBatchMessage('创建任务失败：'+d.error);btn.disabled=false;return}
+    currentBatchJob=d.job_id;
+    if(batchTimer)clearInterval(batchTimer);
+    batchTimer=setInterval(pollBatch,1000);
+    pollBatch();
+  }catch(e){
+    renderBatchMessage('批量上传失败：'+e);
+    btn.disabled=false;
+  }
+}
+
+async function pollBatch(){
+  if(!currentBatchJob)return;
+  try{
+    const r=await fetch('/api/batch/status?job_id='+encodeURIComponent(currentBatchJob));
+    const d=await r.json();
+    if(d.error){renderBatchMessage('任务查询失败：'+d.error);return}
+    renderBatchStatus(d);
+    if(d.status==='done'||d.status==='failed'){
+      clearInterval(batchTimer); batchTimer=null;
+      document.getElementById('batchStart').disabled=false;
+    }
+  }catch(e){renderBatchMessage('任务查询失败：'+e)}
+}
+
+function renderBatchMessage(msg){
+  document.getElementById('batchSummary').innerHTML='<span>'+esc(msg)+'</span>';
+}
+
+function renderBatchStatus(d){
+  const total=d.total||0, done=d.processed||0;
+  const pct=total?Math.round(done*100/total):0;
+  document.getElementById('batchBar').style.width=pct+'%';
+  const s=d.stats||{};
+  document.getElementById('batchSummary').innerHTML=
+    '<span>状态：'+esc(d.status)+'</span>'+
+    '<span>进度：'+done+'/'+total+'</span>'+
+    '<span>A命中：'+(s.a_hits||0)+'</span>'+
+    '<span>B命中：'+(s.b_hits||0)+'</span>'+
+    '<span>体系扩展：'+(s.extensions||0)+'</span>'+
+    '<span>错误：'+(s.errors||0)+'</span>';
+  renderBatchPreview(d.preview||[]);
+  const dl=document.getElementById('batchDownload');
+  dl.style.display=d.download_ready?'inline-block':'none';
+}
+
+function renderBatchPreview(rows){
+  if(!rows.length){document.getElementById('batchPreview').innerHTML='';return}
+  const body=rows.map(r=>'<tr>'+
+    '<td>'+esc(r.row_no)+'</td><td>'+esc(r.split_seq)+'</td><td>'+esc(r.product)+'</td><td>'+esc(r.route_a)+'</td><td>'+esc(r.route_b)+'</td>'+
+    '<td>'+esc(r.final_route)+'</td><td>'+esc(r.final_node_id||'-')+'</td><td>'+esc(r.final_path||'-')+'</td>'+
+    '<td>'+esc(r.extension)+'</td><td>'+esc(r.action||'-')+'</td><td>'+esc(r.review_status||'-')+'</td><td>'+esc(r.error||'')+'</td>'+
+    '</tr>').join('');
+  document.getElementById('batchPreview').innerHTML=
+    '<table><thead><tr><th>行号</th><th>拆分序号</th><th>拆分后产品名</th><th>Route A</th><th>Route B</th><th>最终流向</th><th>node_id</th><th>路径</th><th>扩展</th><th>建议动作</th><th>复核</th><th>错误</th></tr></thead><tbody>'+body+'</tbody></table>';
+}
+
+function downloadBatch(){
+  if(!currentBatchJob)return;
+  window.location='/api/batch/download?job_id='+encodeURIComponent(currentBatchJob);
+}
  getState();
 </script>
 </body></html>"""
@@ -356,16 +501,42 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _send_file(self, path: Path):
+        if not path.exists():
+            return self._send(404, json.dumps({"error": "file not found"}))
+        data = path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        self.send_header("Content-Disposition", f'attachment; filename="{path.name}"')
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def do_GET(self):
-        if self.path in ("/", "/index.html"):
+        parsed = urlparse(self.path)
+        if parsed.path in ("/", "/index.html"):
             self._send(200, PAGE, "text/html")
-        elif self.path == "/api/state":
+        elif parsed.path == "/api/state":
             self._send(200, json.dumps({
                 "embedder": CURRENT_EMBEDDER,
                 "method": CURRENT_METHOD,
             }))
-        elif self.path == "/api/embedder":
+        elif parsed.path == "/api/embedder":
             self._send(200, json.dumps({"embedder": CURRENT_EMBEDDER}))
+        elif parsed.path == "/api/batch/status":
+            job_id = (parse_qs(parsed.query).get("job_id") or [""])[0]
+            with BATCH_LOCK:
+                job = BATCH_JOBS.get(job_id)
+                body = job.to_dict() if job else {"error": "job not found"}
+            self._send(200 if job else 404, json.dumps(body, ensure_ascii=False))
+        elif parsed.path == "/api/batch/download":
+            job_id = (parse_qs(parsed.query).get("job_id") or [""])[0]
+            with BATCH_LOCK:
+                job = BATCH_JOBS.get(job_id)
+                result_path = job.result_path if job else None
+            if not job:
+                return self._send(404, json.dumps({"error": "job not found"}))
+            self._send_file(result_path)
         else:
             self._send(404, json.dumps({"error": "not found"}))
 
@@ -501,6 +672,47 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, json.dumps({"embedder": emb, "note": note}))
             except Exception as e:
                 self._send(500, json.dumps({"error": str(e)}))
+
+        elif self.path == "/api/batch/start":
+            n = int(self.headers.get("Content-Length", 0))
+            payload = json.loads(self.rfile.read(n) or b"{}")
+            filename = (payload.get("filename") or "input.xlsx").strip()
+            mode = (payload.get("mode") or "local").strip()
+            limit = int(payload.get("limit") or 200)
+            data_b64 = payload.get("data_base64") or ""
+            if mode not in {"local", "full", "sampled"}:
+                return self._send(400, json.dumps({"error": "mode must be local, full, or sampled"}))
+            if not filename.lower().endswith(".xlsx"):
+                return self._send(400, json.dumps({"error": "only .xlsx is supported"}))
+            if not data_b64:
+                return self._send(400, json.dumps({"error": "empty upload"}))
+            limit = max(1, min(limit, 5000))
+
+            job_id = uuid.uuid4().hex[:12]
+            job_dir = BATCH_DIR / job_id
+            job_dir.mkdir(parents=True, exist_ok=True)
+            input_path = job_dir / "input.xlsx"
+            result_path = job_dir / "result.xlsx"
+            try:
+                input_path.write_bytes(base64.b64decode(data_b64))
+            except Exception as e:
+                return self._send(400, json.dumps({"error": f"invalid file data: {e}"}))
+
+            job = BatchJob(job_id, input_path, result_path, mode, limit)
+            with BATCH_LOCK:
+                BATCH_JOBS[job_id] = job
+
+            def progress(updated_job):
+                with BATCH_LOCK:
+                    BATCH_JOBS[updated_job.job_id] = updated_job
+
+            thread = threading.Thread(
+                target=process_batch,
+                args=(job, MAPPER, PI_MAPPER, progress),
+                daemon=True,
+            )
+            thread.start()
+            self._send(200, json.dumps({"job_id": job_id}, ensure_ascii=False))
         else:
             self._send(404, json.dumps({"error": "not found"}))
 
@@ -539,7 +751,7 @@ def main(port: int = 8000):
     print(f"\n索引就绪：{len(MAPPER.nodes)} 节点")
     print(f"  Route A (RAG):        Embedder={CURRENT_EMBEDDER}, LLM={'已启用' if config.has_llm() else '未启用'}")
     print(f"  Route B (PageIndex):  LLM={'已启用' if config.has_llm() else '未启用'}, ST={st_info}")
-    print(f"  Hybrid:               A → B fallback (低置信度时触发)")
+    print(f"  Hybrid:               A+B 双路线展示，双不可靠时触发体系扩展")
 
     srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     print(f"\n打开浏览器访问：http://localhost:{port}   （Ctrl+C 停止）")
