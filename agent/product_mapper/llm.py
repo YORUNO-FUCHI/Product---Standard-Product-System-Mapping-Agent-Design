@@ -13,6 +13,24 @@ class LLMUnavailable(Exception):
     pass
 
 
+_LLM_STATS = {
+    "requests": 0,
+    "failures": 0,
+    "prompt_chars": 0,
+    "completion_chars": 0,
+    "total_tokens": 0,
+}
+
+
+def reset_llm_stats():
+    for key in _LLM_STATS:
+        _LLM_STATS[key] = 0
+
+
+def get_llm_stats():
+    return dict(_LLM_STATS)
+
+
 def chat_json(system: str, user: str, temperature: float = 0.0, timeout: int = 60):
     """调用 DeepSeek，返回解析后的 JSON dict；不可用或失败时返回 None。"""
     if not config.has_llm():
@@ -32,13 +50,20 @@ def chat_json(system: str, user: str, temperature: float = 0.0, timeout: int = 6
         "temperature": temperature,
         "response_format": {"type": "json_object"},
     }
+    _LLM_STATS["requests"] += 1
+    _LLM_STATS["prompt_chars"] += len(system or "") + len(user or "")
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=timeout,
                              proxies={"http": None, "https": None})
         resp.raise_for_status()
-        content = resp.json()["choices"][0]["message"]["content"]
+        data = resp.json()
+        usage = data.get("usage") or {}
+        _LLM_STATS["total_tokens"] += int(usage.get("total_tokens") or 0)
+        content = data["choices"][0]["message"]["content"]
+        _LLM_STATS["completion_chars"] += len(content or "")
         return _safe_json(content)
     except Exception as e:
+        _LLM_STATS["failures"] += 1
         print(f"[LLM] 调用失败，降级处理：{e}")
         return None
 

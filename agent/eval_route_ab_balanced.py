@@ -29,7 +29,9 @@ sys.path.insert(0, str(ROOT))
 from product_mapper import config  # noqa: E402
 from product_mapper.agent import ProductMapper  # noqa: E402
 from product_mapper.embedder import st_available  # noqa: E402
+from product_mapper.llm import chat_json, get_llm_stats, reset_llm_stats  # noqa: E402
 from product_mapper.pageindex_mapper import PageIndexMapper  # noqa: E402
+from product_mapper.rerank import _fuse  # noqa: E402
 from product_mapper.taxonomy import load_nodes  # noqa: E402
 
 
@@ -87,6 +89,26 @@ DETAIL_HEADERS = [
     "最终采用路线", "最终node_id", "最终name", "最终path", "最终confidence", "最终source",
     "复核建议",
 ]
+
+EXTENSION_HEADERS = [
+    "未命中产品名", "原sheet", "原序号", "原始名称", "清洗后名称",
+    "最接近候选节点", "最接近候选路径", "候选分数",
+    "建议动作", "建议新增节点名", "建议父节点node_id", "建议父节点路径",
+    "建议同义词", "建议理由", "优先级", "复核状态",
+]
+
+EXTENSION_ACTIONS = {
+    "清洗异常/不扩展",
+    "补同义词",
+    "新增叶子节点",
+    "新增中间节点",
+    "体系外/新增大类",
+}
+
+EXTENSION_SYSTEM = """你是产品标准体系维护助手。请判断一个未命中产品应该如何处理。
+只能从这些建议动作中选择一个：清洗异常/不扩展、补同义词、新增叶子节点、新增中间节点、体系外/新增大类。
+严格输出 JSON：
+{"action":"<建议动作>","new_node_name":"<建议新增节点名或空>","parent_node_id":<int或null>,"parent_path":"<建议父节点路径或空>","synonyms":["<建议同义词>"],"reason":"<简短理由>","priority":"高/中/低"}"""
 
 
 @dataclass
@@ -395,6 +417,59 @@ def build_local_rows(records: list[Record], mapper_a: ProductMapper, mapper_b: P
     return rows
 
 
+def stratified_sample_rows(rows: list[dict], sample_size: int, sample_seed: int) -> list[dict]:
+    if sample_size <= 0 or sample_size >= len(rows):
+        return rows
+
+    rng = random.Random(sample_seed)
+    by_bucket: dict[str, list[dict]] = defaultdict(list)
+    for row in rows:
+        by_bucket[row["样本桶"]].append(row)
+
+    bucket_order = [
+        BUCKET_AGREE_HIGH,
+        BUCKET_A_STRONG_B_WEAK,
+        BUCKET_B_STRONG_A_WEAK,
+        BUCKET_CONFLICT,
+        BUCKET_BOTH_EMPTY,
+        BUCKET_LONG_OR_DAMAGED,
+        BUCKET_LOW_REVIEW,
+    ]
+    active_buckets = [b for b in bucket_order if by_bucket.get(b)]
+    if not active_buckets:
+        return rng.sample(rows, sample_size)
+
+    selected: list[dict] = []
+    selected_ids: set[int] = set()
+    base_take = max(1, sample_size // len(active_buckets))
+    for bucket in active_buckets:
+        candidates = by_bucket[bucket]
+        take = min(base_take, len(candidates), sample_size - len(selected))
+        if take <= 0:
+            continue
+        picked = rng.sample(candidates, take)
+        selected.extend(picked)
+        selected_ids.update(id(row) for row in picked)
+
+    if len(selected) < sample_size:
+        remaining = [row for row in rows if id(row) not in selected_ids]
+        selected.extend(rng.sample(remaining, min(sample_size - len(selected), len(remaining))))
+
+    selected.sort(key=lambda r: (str(r["原sheet"]), str(r["原序号"]), int(r["拆分序号"] or 0)))
+    return selected
+
+
+def apply_sampling(rows: list[dict], sample_mode: str, sample_size: int | None,
+                   sample_seed: int) -> list[dict]:
+    if sample_size is None:
+        return rows
+    if sample_mode == "first":
+        return rows[:sample_size]
+    if sample_mode == "stratified":
+        return stratified_sample_rows(rows, sample_size, sample_seed)
+    raise ValueError(f"unknown sample mode: {sample_mode}")
+
+
 def scaled_bucket_targets(llm_budget: int) -> dict[str, int]:
     if llm_budget <= 0:
         return {}
@@ -526,6 +601,189 @@ def apply_llm_stage(rows: list[dict], mapper_a: ProductMapper, mapper_b: PageInd
     config.DEEPSEEK_API_KEY = ""
 
 
+def extension_triggered(row: dict) -> bool:
+    called_a = "Route A LLM" in row.get("LLM调用阶段", "")
+    called_b = "Route B LLM" in row.get("LLM调用阶段", "")
+    if called_a or called_b:
+        return (not hit(row["A_LLM"])) and (not hit(row["B_LLM"]))
+    return (not hit(row["A_local"])) and (not hit(row["B_local"]))
+
+
+def nearest_taxonomy_candidates(mapper_a: ProductMapper, product: str, top_k: int = 5) -> list[dict]:
+    original_key = config.DEEPSEEK_API_KEY
+    config.DEEPSEEK_API_KEY = ""
+    try:
+        cands = mapper_a.recaller.recall(product)
+        ordered = _fuse(cands)[:top_k]
+    finally:
+        config.DEEPSEEK_API_KEY = original_key
+
+    items = []
+    for cand in ordered:
+        node = cand.node
+        parent_id = node.parent_id if node.is_leaf else node.id
+        if node.is_leaf and len(node.path_names) > 1:
+            parent_path = " > ".join(node.path_names[:-1])
+        else:
+            parent_path = node.path_str
+        items.append({
+            "node_id": node.id,
+            "name": node.name,
+            "path": node.path_str,
+            "parent_id": parent_id,
+            "parent_path": parent_path,
+            "is_leaf": node.is_leaf,
+            "score": round(float(getattr(cand, "fused", 0.0)), 3),
+            "trgm": round(float(getattr(cand, "trgm", 0.0)), 3),
+            "vec": round(float(getattr(cand, "vec", 0.0)), 3),
+        })
+    return items
+
+
+def format_extension_candidates(candidates: list[dict]) -> str:
+    lines = []
+    for i, item in enumerate(candidates, 1):
+        lines.append(
+            f"{i}. node_id={item['node_id']} | {item['path']} | "
+            f"score={item['score']}, trgm={item['trgm']}, vec={item['vec']}"
+        )
+    return "\n".join(lines) if lines else "无候选"
+
+
+def normalize_extension_output(out: dict | None, product: str, candidates: list[dict]) -> dict:
+    best = candidates[0] if candidates else {}
+    if not out:
+        if looks_damaged(product):
+            action = "清洗异常/不扩展"
+            priority = "低"
+            reason = "产品名过短、疑似型号或清洗后存在异常字符，先复核清洗结果"
+        elif best and best.get("score", 0.0) >= 1.0:
+            action = "补同义词"
+            priority = "中"
+            reason = "存在相近标准节点，优先作为同义词候选人工确认"
+        elif best and best.get("score", 0.0) >= 0.45:
+            action = "新增叶子节点"
+            priority = "中"
+            reason = "存在相近父路径，但当前体系缺少更细产品节点"
+        else:
+            action = "体系外/新增大类"
+            priority = "低"
+            reason = "没有足够相近的候选路径，建议人工判断是否属于体系外领域"
+        return {
+            "action": action,
+            "new_node_name": "" if action in {"清洗异常/不扩展", "补同义词"} else product,
+            "parent_node_id": best.get("parent_id"),
+            "parent_path": best.get("parent_path", ""),
+            "synonyms": [product] if action == "补同义词" else [],
+            "reason": reason,
+            "priority": priority,
+        }
+
+    action = str(out.get("action") or "").strip()
+    if action not in EXTENSION_ACTIONS:
+        action = "体系外/新增大类"
+    synonyms = out.get("synonyms") or []
+    if not isinstance(synonyms, list):
+        synonyms = [str(synonyms)]
+    parent_node_id = out.get("parent_node_id")
+    try:
+        parent_node_id = int(parent_node_id) if parent_node_id not in (None, "") else None
+    except Exception:
+        parent_node_id = None
+    priority = str(out.get("priority") or "中").strip()
+    if priority not in {"高", "中", "低"}:
+        priority = "中"
+    return {
+        "action": action,
+        "new_node_name": str(out.get("new_node_name") or "").strip(),
+        "parent_node_id": parent_node_id,
+        "parent_path": str(out.get("parent_path") or "").strip(),
+        "synonyms": [str(x).strip() for x in synonyms if str(x).strip()],
+        "reason": str(out.get("reason") or "").strip(),
+        "priority": priority,
+    }
+
+
+def extension_llm_suggest(product: str, raw: str, cleaned: str,
+                          candidates: list[dict], original_key: str) -> dict | None:
+    if not original_key:
+        return None
+    user = (
+        f"未命中产品名：{product}\n"
+        f"原始名称：{raw}\n"
+        f"清洗后名称：{cleaned}\n\n"
+        f"最接近候选节点 Top5：\n{format_extension_candidates(candidates)}"
+    )
+    config.DEEPSEEK_API_KEY = original_key
+    try:
+        return chat_json(EXTENSION_SYSTEM, user, timeout=60)
+    finally:
+        config.DEEPSEEK_API_KEY = ""
+
+
+def build_extension_suggestions(rows: list[dict], mapper_a: ProductMapper,
+                                original_key: str) -> list[dict]:
+    suggestions: list[dict] = []
+    for row in rows:
+        if not extension_triggered(row):
+            continue
+        product = row["测试输入"]
+        candidates = nearest_taxonomy_candidates(mapper_a, product, top_k=5)
+        llm_out = extension_llm_suggest(product, row["原始名称"], row["清洗后名称"],
+                                        candidates, original_key)
+        suggestion = normalize_extension_output(llm_out, product, candidates)
+        best = candidates[0] if candidates else {}
+        suggestions.append({
+            "未命中产品名": product,
+            "原sheet": row["原sheet"],
+            "原序号": row["原序号"],
+            "原始名称": row["原始名称"],
+            "清洗后名称": row["清洗后名称"],
+            "最接近候选节点": best.get("name", ""),
+            "最接近候选路径": best.get("path", ""),
+            "候选分数": best.get("score", ""),
+            "建议动作": suggestion["action"],
+            "建议新增节点名": suggestion["new_node_name"],
+            "建议父节点node_id": suggestion["parent_node_id"] if suggestion["parent_node_id"] is not None else "",
+            "建议父节点路径": suggestion["parent_path"],
+            "建议同义词": "、".join(suggestion["synonyms"]),
+            "建议理由": suggestion["reason"],
+            "优先级": suggestion["priority"],
+            "复核状态": "待复核",
+        })
+    config.DEEPSEEK_API_KEY = original_key
+    return suggestions
+
+
+def flatten_extension(row: dict) -> list:
+    return [row.get(header, "") for header in EXTENSION_HEADERS]
+
+
+def estimate_llm_call_count(rows: list[dict], extension_rows: list[dict]) -> int:
+    count = 0
+    for row in rows:
+        stage = row.get("LLM调用阶段", "")
+        if "Route A LLM" in stage and row["A_LLM"].get("source") != "exact_match":
+            count += 1
+        if "Route B LLM" in stage and row["B_LLM"].get("source") != "pageindex_exact":
+            count += 1
+    count += len(extension_rows)
+    return count
+
+
+def estimate_token_cost(rows: list[dict], extension_rows: list[dict]) -> int:
+    # Rough estimate for planning/reporting only. DeepSeek usage is not exposed by llm.py yet.
+    route_a_calls = 0
+    route_b_calls = 0
+    for row in rows:
+        stage = row.get("LLM调用阶段", "")
+        if "Route A LLM" in stage and row["A_LLM"].get("source") != "exact_match":
+            route_a_calls += 1
+        if "Route B LLM" in stage and row["B_LLM"].get("source") != "pageindex_exact":
+            route_b_calls += 1
+    return route_a_calls * 1800 + route_b_calls * 4500 + len(extension_rows) * 1200
+
+
 def flatten_detail(row: dict) -> list:
     a, b = row["A_local"], row["B_local"]
     a_llm, b_llm = row["A_LLM"], row["B_LLM"]
@@ -547,9 +805,9 @@ def flatten_detail(row: dict) -> list:
     ]
 
 
-def append_jsonl(rows: list[dict]) -> None:
-    JSONL_PATH.parent.mkdir(exist_ok=True)
-    with JSONL_PATH.open("w", encoding="utf-8") as f:
+def append_jsonl(rows: list[dict], jsonl_path: Path) -> None:
+    jsonl_path.parent.mkdir(exist_ok=True)
+    with jsonl_path.open("w", encoding="utf-8") as f:
         for row in rows:
             f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
 
@@ -578,18 +836,26 @@ def ratio(numerator: int | float, denominator: int | float) -> float:
     return float(numerator) / float(denominator) if denominator else 0.0
 
 
-def summarize(rows: list[dict], started: float, embedder: str, strategy: str,
-              llm_budget: int, route_b_llm: bool, route_b_llm_budget: int,
-              sample_seed: int) -> list[tuple]:
+def summarize(rows: list[dict], extension_rows: list[dict], llm_stats: dict,
+              started: float, embedder: str, strategy: str, llm_budget: int, route_b_llm: bool,
+              route_b_llm_budget: int, sample_seed: int) -> list[tuple]:
     n = len(rows)
     source_rows = len({(r["原sheet"], r["原序号"]) for r in rows})
     a_hits = sum(1 for r in rows if hit(r["A_local"]))
     b_hits = sum(1 for r in rows if hit(r["B_local"]))
+    a_llm_hit = sum(1 for r in rows if hit(r["A_LLM"]))
+    b_llm_hit = sum(1 for r in rows if hit(r["B_LLM"]))
     final_hits = sum(1 for r in rows if hit(r["最终"]))
     both_hit = [r for r in rows if hit(r["A_local"]) and hit(r["B_local"])]
     agree = sum(1 for r in both_hit if r["A_local"]["node_id"] == r["B_local"]["node_id"])
     conflict = sum(1 for r in both_hit if r["A_local"]["node_id"] != r["B_local"]["node_id"])
+    both_llm_hit = [r for r in rows if hit(r["A_LLM"]) and hit(r["B_LLM"])]
+    llm_agree = sum(1 for r in both_llm_hit if r["A_LLM"]["node_id"] == r["B_LLM"]["node_id"])
+    llm_conflict = sum(1 for r in both_llm_hit if r["A_LLM"]["node_id"] != r["B_LLM"]["node_id"])
+    double_miss = sum(1 for r in rows if extension_triggered(r))
     llm_rows = sum(1 for r in rows if r["是否进入LLM抽样"] == "是")
+    llm_call_count = int(llm_stats.get("requests", 0) or 0)
+    estimated_tokens = estimate_token_cost(rows, extension_rows)
     auto_accept = sum(1 for r in rows if r["是否自动接受"] == "是")
     review = sum(1 for r in rows if r["是否待人工复核"] == "是")
     b_source_counts = Counter(r["B_local"]["source"] for r in rows)
@@ -604,9 +870,15 @@ def summarize(rows: list[dict], started: float, embedder: str, strategy: str,
         ("LLM调用比例", ratio(llm_rows, n), ""),
         ("Route A本地命中率", ratio(a_hits, n), ""),
         ("Route B本地命中率", ratio(b_hits, n), ""),
+        ("Route A完整命中率", ratio(a_llm_hit, n), "统计 A_LLM 结果；未启用 LLM 时为 0"),
+        ("Route B完整命中率", ratio(b_llm_hit, n), "统计 B_LLM 结果；未启用 LLM 时为 0"),
         ("Hybrid最终命中率", ratio(final_hits, n), ""),
         ("A/B本地一致率", ratio(agree, len(both_hit)), "仅统计 A/B 都命中的样本"),
         ("A/B本地冲突率", ratio(conflict, len(both_hit)), "仅统计 A/B 都命中的样本"),
+        ("A/B完整一致率", ratio(llm_agree, len(both_llm_hit)), "仅统计 A_LLM/B_LLM 都命中的样本"),
+        ("A/B完整冲突率", ratio(llm_conflict, len(both_llm_hit)), "仅统计 A_LLM/B_LLM 都命中的样本"),
+        ("双路线未命中数量", double_miss, "完整 LLM 模式优先看 A_LLM+B_LLM，非 LLM 模式看本地 A+B"),
+        ("体系扩展建议数量", len(extension_rows), ""),
         ("Route B精确匹配比例", ratio(b_source_counts.get("pageindex_exact", 0), n), ""),
         ("Route B强候选比例", ratio(b_source_counts.get("pageindex_trigram", 0), n), ""),
         ("Route B弱候选比例", ratio(b_source_counts.get("pageindex_trigram_weak", 0), n), ""),
@@ -615,6 +887,13 @@ def summarize(rows: list[dict], started: float, embedder: str, strategy: str,
         ("Route B平均本地置信度", sum(r["B_local"]["confidence"] for r in rows) / max(1, n), ""),
         ("Route A平均本地延迟ms", sum(r["A_local"]["latency_ms"] for r in rows) / max(1, n), ""),
         ("Route B平均本地延迟ms", sum(r["B_local"]["latency_ms"] for r in rows) / max(1, n), ""),
+        ("Route A平均完整延迟ms", sum(r["A_LLM"]["latency_ms"] for r in rows if r["A_LLM"]["source"]) / max(1, sum(1 for r in rows if r["A_LLM"]["source"])), ""),
+        ("Route B平均完整延迟ms", sum(r["B_LLM"]["latency_ms"] for r in rows if r["B_LLM"]["source"]) / max(1, sum(1 for r in rows if r["B_LLM"]["source"])), ""),
+        ("LLM实际请求次数", llm_call_count, "由底层 LLM 客户端统计；Route B 树搜索可能一次样本多次请求"),
+        ("LLM失败次数", int(llm_stats.get("failures", 0) or 0), ""),
+        ("LLM返回真实tokens", int(llm_stats.get("total_tokens", 0) or 0), "API 未返回 usage 时为 0"),
+        ("LLM请求字符数", int(llm_stats.get("prompt_chars", 0) or 0), ""),
+        ("token成本估算", estimated_tokens, "粗估：Route A 1800/次，Route B 4500/次，体系扩展 1200/次"),
         ("总耗时秒", time.time() - started, ""),
         ("Route A embedder", embedder, ""),
         ("LLM strategy", strategy, ""),
@@ -646,17 +925,18 @@ def write_bucket_stats(wb: Workbook, rows: list[dict]) -> None:
         ])
 
 
-def write_excel(rows: list[dict], started: float, embedder: str, strategy: str,
+def write_excel(rows: list[dict], extension_rows: list[dict], llm_stats: dict,
+                output_path: Path, jsonl_path: Path, started: float, embedder: str, strategy: str,
                 llm_budget: int, route_b_llm: bool, route_b_llm_budget: int,
-                sample_seed: int) -> None:
-    OUTPUT_XLSX.parent.mkdir(exist_ok=True)
+                sample_seed: int, sample_mode: str, sample_size: int | None) -> None:
+    output_path.parent.mkdir(exist_ok=True)
     wb = Workbook()
 
     ws_summary = wb.active
     ws_summary.title = "实验汇总"
     append_header(ws_summary, ["指标", "数值", "说明"])
-    for item in summarize(rows, started, embedder, strategy, llm_budget, route_b_llm,
-                          route_b_llm_budget, sample_seed):
+    for item in summarize(rows, extension_rows, llm_stats, started, embedder, strategy,
+                          llm_budget, route_b_llm, route_b_llm_budget, sample_seed):
         ws_summary.append(item)
 
     ws_detail = wb.create_sheet("全量本地明细")
@@ -690,6 +970,11 @@ def write_excel(rows: list[dict], started: float, embedder: str, strategy: str,
         if row["是否待人工复核"] == "是":
             ws_review.append(flatten_detail(row))
 
+    ws_extension = wb.create_sheet("体系扩展建议")
+    append_header(ws_extension, EXTENSION_HEADERS)
+    for row in extension_rows:
+        ws_extension.append(flatten_extension(row))
+
     ws_dist = wb.create_sheet("来源分布")
     append_header(ws_dist, ["路线", "source", "数量", "占比"])
     for route, key in [("Route A Local", "A_local"), ("Route B Local", "B_local"),
@@ -704,8 +989,8 @@ def write_excel(rows: list[dict], started: float, embedder: str, strategy: str,
     append_header(ws_config, ["配置项", "值"])
     config_rows = [
         ("输入文件", str(INPUT_XLSX)),
-        ("输出文件", str(OUTPUT_XLSX)),
-        ("中间JSONL", str(JSONL_PATH)),
+        ("输出文件", str(output_path)),
+        ("中间JSONL", str(jsonl_path)),
         ("Route A embedder", embedder),
         ("LOW_CONF", LOW_CONF),
         ("ACCEPT_CONF", ACCEPT_CONF),
@@ -715,9 +1000,14 @@ def write_excel(rows: list[dict], started: float, embedder: str, strategy: str,
         ("Route A LLM TopK", ROUTE_A_LLM_TOPK),
         ("LLM strategy", strategy),
         ("LLM budget", llm_budget),
+        ("sample mode", sample_mode),
+        ("sample size", "" if sample_size is None else sample_size),
         ("Route B LLM树搜索", "启用" if route_b_llm else "禁用"),
         ("Route B LLM budget", route_b_llm_budget),
         ("sample seed", sample_seed),
+        ("LLM actual requests", int(llm_stats.get("requests", 0) or 0)),
+        ("LLM failures", int(llm_stats.get("failures", 0) or 0)),
+        ("LLM total_tokens", int(llm_stats.get("total_tokens", 0) or 0)),
         ("K_TRGM", config.K_TRGM),
         ("K_VEC", config.K_VEC),
         ("K_RERANK", config.K_RERANK),
@@ -729,7 +1019,7 @@ def write_excel(rows: list[dict], started: float, embedder: str, strategy: str,
 
     for ws in wb.worksheets:
         autosize(ws)
-    wb.save(OUTPUT_XLSX)
+    wb.save(output_path)
 
 
 def normalize_strategy(args: argparse.Namespace, original_key: str) -> str:
@@ -741,9 +1031,23 @@ def normalize_strategy(args: argparse.Namespace, original_key: str) -> str:
     return strategy
 
 
+def resolve_output_path(raw: str | None) -> Path:
+    if not raw:
+        return OUTPUT_XLSX
+    path = Path(raw)
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return path
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Low-token balanced Route A / Route B evaluation")
     parser.add_argument("--limit", type=int, default=None, help="limit split product items for smoke tests")
+    parser.add_argument("--sample-mode", choices=["none", "first", "stratified"], default="none",
+                        help="optional sampling after local A/B bucketing")
+    parser.add_argument("--sample-size", type=int, default=None,
+                        help="number of split product items kept after sampling")
+    parser.add_argument("--output", type=str, default=None, help="output Excel path")
     parser.add_argument("--llm-strategy", choices=["none", "sampled", "full-a", "full-b", "full-ab"],
                         default="sampled", help="LLM usage strategy")
     parser.add_argument("--llm-budget", type=int, default=200, help="sampled strategy LLM sample budget")
@@ -770,8 +1074,10 @@ def main() -> None:
     if strategy == "none" and args.llm_strategy != "none":
         print("[提示] 未检测到可用 API key 或已禁用 LLM，本次只跑全量本地 A/B。")
 
-    if JSONL_PATH.exists():
-        JSONL_PATH.unlink()
+    output_path = resolve_output_path(args.output)
+    jsonl_path = output_path.with_suffix(".jsonl")
+    if jsonl_path.exists():
+        jsonl_path.unlink()
 
     started = time.time()
     print("读取清洗数据...")
@@ -789,7 +1095,12 @@ def main() -> None:
 
     print(f"第一阶段: 全量本地 A/B，embedder={args.embedder}")
     rows = build_local_rows(records, mapper_a, mapper_b, original_key)
+    if args.sample_mode != "none" and args.sample_size:
+        before = len(rows)
+        rows = apply_sampling(rows, args.sample_mode, args.sample_size, args.sample_seed)
+        print(f"抽样完成: {before} -> {len(rows)}，mode={args.sample_mode}, seed={args.sample_seed}")
 
+    reset_llm_stats()
     print(
         f"第二阶段: LLM strategy={strategy}, llm_budget={args.llm_budget}, "
         f"route_b_llm={'启用' if args.route_b_llm else '禁用'}"
@@ -797,12 +1108,18 @@ def main() -> None:
     apply_llm_stage(rows, mapper_a, mapper_b, original_key, strategy, args.llm_budget,
                     args.route_b_llm, args.route_b_llm_budget, args.sample_seed)
 
+    print("生成体系扩展建议...")
+    extension_rows = build_extension_suggestions(rows, mapper_a, original_key)
+    print(f"体系扩展建议数量: {len(extension_rows)}")
+    llm_stats = get_llm_stats()
+
     print("写入结果文件...")
-    append_jsonl(rows)
-    write_excel(rows, started, args.embedder, strategy, args.llm_budget,
-                args.route_b_llm, args.route_b_llm_budget, args.sample_seed)
+    append_jsonl(rows, jsonl_path)
+    write_excel(rows, extension_rows, llm_stats, output_path, jsonl_path, started, args.embedder,
+                strategy, args.llm_budget, args.route_b_llm, args.route_b_llm_budget,
+                args.sample_seed, args.sample_mode, args.sample_size)
     config.DEEPSEEK_API_KEY = original_key
-    print(f"完成: {OUTPUT_XLSX}")
+    print(f"完成: {output_path}")
 
 
 if __name__ == "__main__":

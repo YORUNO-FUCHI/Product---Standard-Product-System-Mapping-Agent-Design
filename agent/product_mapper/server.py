@@ -10,8 +10,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import config
 from .agent import ProductMapper
-from .pageindex_mapper import PageIndexMapper
 from .embedder import st_available
+from .extension import append_extension_record, route_a_reliable, route_b_reliable, suggest_extension
+from .pageindex_mapper import PageIndexMapper
 
 MAPPER = None         # Route A
 PI_MAPPER = None      # Route B
@@ -66,6 +67,15 @@ PAGE = r"""<!DOCTYPE html>
  .trace-num{background:#1e3a5f;color:#93c5fd;border-radius:50%;width:24px;height:24px;display:flex;align-items:center;justify-content:center;font-size:12px;flex-shrink:0}
  .trace-info{flex:1} .trace-name{font-weight:600;color:#e2e8f0} .trace-reason{font-size:12px;color:#94a3b8;margin-top:2px}
  .trace-conf{font-size:11px;color:#64748b}
+ .flow{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:20px}
+ .flow-step{background:#1e293b;border:1px solid #334155;border-radius:10px;padding:12px;min-height:76px}
+ .flow-step.done{border-color:#22c55e}.flow-step.warn{border-color:#f59e0b}.flow-step.stop{border-color:#ef4444}
+ .flow-title{font-size:13px;color:#e2e8f0;font-weight:600}.flow-desc{font-size:12px;color:#94a3b8;margin-top:6px;line-height:1.5}
+ .grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+ .extension{border-color:#f59e0b;background:#221a10}
+ .kv{display:grid;grid-template-columns:120px 1fr;gap:8px 14px;margin-top:14px;font-size:13px}
+ .kv .k{color:#94a3b8}.kv .v{color:#e2e8f0}
+ @media(max-width:760px){.flow{grid-template-columns:1fr}.grid{grid-template-columns:1fr}.bar{flex-direction:column}.kv{grid-template-columns:1fr}}
 </style></head><body><div class="wrap">
  <h1>产品 - 标准产品体系映射智能体</h1>
  <div class="sub" id="subtitle">双路召回（trigram + 向量）→ 融合 + LLM 精排 → 唯一标准节点</div>
@@ -100,7 +110,7 @@ PAGE = r"""<!DOCTYPE html>
  <div id="out"></div>
 </div>
 <script>
-const SAMPLES=["苞米","独头蒜","Vigna radiata","红富士苹果","笔记本电脑","工业机器人","华为Matebook X Pro","大疆无人机Mavic 3","特斯拉Model 3电池包","隆基绿能光伏板"];
+const SAMPLES=["苞米","独头蒜","Vigna radiata","红富士苹果","笔记本电脑","工业机器人","华为Matebook X Pro","大疆无人机Mavic 3","特斯拉Model 3电池包","XYZ999999","火星地产会员卡"];
 const chips=document.getElementById('chips');
 SAMPLES.forEach(s=>{const c=document.createElement('span');c.className='chip';c.textContent=s;
   c.onclick=()=>{document.getElementById('q').value=s;run()};chips.appendChild(c)});
@@ -186,7 +196,8 @@ async function run(){
   try{
     const r=await fetch(apiUrl,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({product:q})});
     const d=await r.json();
-    if(currentMethod==='pageindex') renderPageIndex(d);
+    if(currentMethod==='hybrid') renderHybrid(d);
+    else if(currentMethod==='pageindex') renderPageIndex(d);
     else renderRAG(d);
   }catch(e){ out.innerHTML='<div class="card miss">请求失败：'+e+'</div>'; }
   load.style.display='none'; go.disabled=false;
@@ -194,6 +205,78 @@ async function run(){
 
 function pathHtml(p){ if(!p)return''; const a=p.split(' > ');
   return a.map((x,i)=>i===a.length-1?'<span class="leaf">'+x+'</span>':x+'<span class="arrow">/</span>').join(''); }
+
+function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
+
+function badgeForSource(source){
+  if(source==='llm') return '<span class="badge b-llm">LLM 精排</span>';
+  if(source==='exact_match'||source==='pageindex_exact') return '<span class="badge b-exact">精确匹配</span>';
+  if(source==='pageindex') return '<span class="badge b-pageindex">PageIndex 树搜索</span>';
+  if(source==='pageindex_trigram'||source==='fusion') return '<span class="badge b-fusion">本地候选</span>';
+  if(source==='pageindex_trigram_weak') return '<span class="badge b-fusion">弱候选</span>';
+  if(source==='hybrid_raga') return '<span class="badge b-hybrid">Hybrid · Route A</span>';
+  if(source==='hybrid_pageindex') return '<span class="badge b-pageindex">Hybrid · Route B</span>';
+  return '<span class="badge b-fusion">'+esc(source||'empty')+'</span>';
+}
+
+function resultCard(title, R, reliable){
+  const hit=R&&R.node_id!==null&&R.node_id!==undefined;
+  const cls=hit?(reliable?'hit':'miss'):'miss';
+  const status=hit?(reliable?'可靠命中':'弱命中 / 待复核'):'未命中';
+  const conf=hit? Number(R.confidence||0):0;
+  const head=hit
+    ? '<h3>'+esc(title)+' · '+status+'</h3><div class="path">'+pathHtml(R.path)+'</div>'
+    : '<h3>'+esc(title)+' · 未命中</h3><div class="path g">没有找到可直接接受的标准节点</div>';
+  return '<div class="card '+cls+'">'+head+
+    '<div class="meta">'+badgeForSource(R&&R.source)+'<span>node_id: '+(hit?R.node_id:'-')+'</span>'+
+    '<span>置信度 '+conf.toFixed(3)+'</span><span>耗时 '+(R&&R.latency_ms!=null?R.latency_ms:'-')+' ms</span></div>'+
+    (hit?'<div class="conf"><i style="width:'+Math.round(conf*100)+'%"></i></div>':'')+
+    (R&&R.reason?'<div class="reason">理由：'+esc(R.reason)+'</div>':'')+'</div>';
+}
+
+function renderFlow(steps){
+  return '<div class="flow">'+(steps||[]).map(s=>{
+    const cls=s.status==='stop'?'stop':(s.status==='warn'?'warn':'done');
+    return '<div class="flow-step '+cls+'"><div class="flow-title">'+esc(s.title)+'</div><div class="flow-desc">'+esc(s.desc)+'</div></div>';
+  }).join('')+'</div>';
+}
+
+function renderExtension(ext){
+  if(!ext)return '';
+  const syn=(ext.synonyms||[]).join('、')||'-';
+  return '<div class="card extension"><h3>体系扩展建议</h3>'+
+    '<div class="path">'+esc(ext.action||'-')+'</div>'+
+    '<div class="kv">'+
+      '<div class="k">建议新增节点</div><div class="v">'+esc(ext.new_node_name||'-')+'</div>'+
+      '<div class="k">建议父节点</div><div class="v">'+esc(ext.parent_path||'-')+'</div>'+
+      '<div class="k">父节点ID</div><div class="v">'+esc(ext.parent_node_id||'-')+'</div>'+
+      '<div class="k">建议同义词</div><div class="v">'+esc(syn)+'</div>'+
+      '<div class="k">最接近候选</div><div class="v">'+esc(ext.nearest_path||'-')+'</div>'+
+      '<div class="k">优先级</div><div class="v">'+esc(ext.priority||'-')+'</div>'+
+      '<div class="k">复核状态</div><div class="v">'+esc(ext.review_status||'待复核')+'</div>'+
+      '<div class="k">保存结果</div><div class="v">'+(ext.saved?'已写入 cache/extension_suggestions':'仅页面展示')+'</div>'+
+    '</div>'+
+    '<div class="reason">建议理由：'+esc(ext.reason||'-')+'</div></div>';
+}
+
+function renderHybrid(d){
+  const a=d.route_a||{}, b=d.route_b||{}, final=d.final||{};
+  let finalHtml='';
+  if(final.node_id!==null&&final.node_id!==undefined){
+    finalHtml='<div class="card hit"><h3>最终采用路线</h3><div class="path">'+esc(final.route||'-')+'</div>'+
+      '<div class="meta"><span>node_id: '+final.node_id+'</span><span>'+esc(final.path||'')+'</span></div></div>';
+  }else{
+    finalHtml='<div class="card miss"><h3>最终结果</h3><div class="path g">Route A 与 Route B 均未可靠命中，进入体系扩展流程</div></div>';
+  }
+  document.getElementById('out').innerHTML=
+    renderFlow(d.flow_steps)+
+    '<div class="grid">'+
+    resultCard('Route A · RAG', a.result||{}, a.reliable)+
+    resultCard('Route B · PageIndex', b.result||{}, b.reliable)+
+    '</div>'+
+    finalHtml+
+    renderExtension(d.extension);
+}
 
 function renderRAG(d){
   const R=d.result, C=d.candidates||[], hit=R.node_id!==null;
@@ -318,35 +401,75 @@ class Handler(BaseHTTPRequestHandler):
             if not product:
                 return self._send(400, json.dumps({"error": "empty product"}))
 
-            # Phase 1: Route A
+            # Hybrid demo runs both routes so the whole decision process is visible.
             result_a, candidates = MAPPER.explain(product)
-            conf_a = result_a.get("confidence", 0)
-            source_a = result_a.get("source", "")
-
-            # 高置信度或精确匹配直接返回
-            if conf_a >= 0.85 or source_a == "exact_match" or (
-                source_a == "llm" and conf_a >= 0.7
-            ):
-                result_a["source"] = "hybrid_raga"
-                body = json.dumps({"result": result_a, "candidates": candidates},
-                                  ensure_ascii=False)
-                return self._send(200, body)
-
-            # Phase 2: Fallback to Route B
             result_b, trace_b = PI_MAPPER.explain(product)
-            conf_b = result_b.get("confidence", 0)
 
-            if result_a.get("node_id") and conf_a >= conf_b:
-                result_a["source"] = "hybrid_raga"
-                body = json.dumps({"result": result_a, "candidates": candidates},
-                                  ensure_ascii=False)
-                return self._send(200, body)
+            a_ok = route_a_reliable(result_a)
+            b_ok = route_b_reliable(result_b)
+            extension = None
+            saved = False
+            if a_ok:
+                final = {
+                    "route": "Route A",
+                    "node_id": result_a.get("node_id"),
+                    "name": result_a.get("name"),
+                    "path": result_a.get("path"),
+                    "confidence": result_a.get("confidence", 0),
+                    "source": result_a.get("source", ""),
+                }
+            elif b_ok:
+                final = {
+                    "route": "Route B",
+                    "node_id": result_b.get("node_id"),
+                    "name": result_b.get("name"),
+                    "path": result_b.get("path"),
+                    "confidence": result_b.get("confidence", 0),
+                    "source": result_b.get("source", ""),
+                }
+            else:
+                extension = suggest_extension(product, MAPPER, result_a, result_b, use_llm=True)
+                try:
+                    append_extension_record(extension)
+                    extension["saved"] = True
+                    saved = True
+                except Exception as e:
+                    extension["saved"] = False
+                    extension["save_error"] = str(e)
+                final = {
+                    "route": "体系扩展",
+                    "node_id": None,
+                    "name": None,
+                    "path": None,
+                    "confidence": 0.0,
+                    "source": "extension",
+                }
 
-            # Route B result with hybrid badge
-            result_b["source"] = "hybrid_pageindex"
+            flow_steps = [
+                {"title": "输入产品名", "desc": product, "status": "done"},
+                {
+                    "title": "Route A 判断",
+                    "desc": "可靠命中" if a_ok else ("弱命中/待复核" if result_a.get("node_id") else "未命中"),
+                    "status": "done" if a_ok else "warn",
+                },
+                {
+                    "title": "Route B 判断",
+                    "desc": "可靠命中" if b_ok else ("弱命中/待复核" if result_b.get("node_id") else "未命中"),
+                    "status": "done" if b_ok else "warn",
+                },
+                {
+                    "title": "最终流向",
+                    "desc": f"采用 {final['route']}" if final.get("node_id") else "进入体系扩展建议",
+                    "status": "done" if final.get("node_id") else "stop",
+                },
+            ]
             body = json.dumps({
-                "result": result_b,
-                "candidates": trace_b,
+                "route_a": {"result": result_a, "candidates": candidates, "reliable": a_ok},
+                "route_b": {"result": result_b, "trace": trace_b, "reliable": b_ok},
+                "final": final,
+                "extension": extension,
+                "flow_steps": flow_steps,
+                "extension_saved": saved,
             }, ensure_ascii=False)
             self._send(200, body)
 
