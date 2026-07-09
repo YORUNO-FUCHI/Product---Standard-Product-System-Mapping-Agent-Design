@@ -44,6 +44,25 @@ def main():
                     "USING gin (search_text gin_trgm_ops);")
         cur.execute("CREATE INDEX ON product_taxonomy "
                     "USING hnsw (embedding vector_cosine_ops);")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS product_synonym_feedback (
+                task_id TEXT PRIMARY KEY,
+                product TEXT NOT NULL,
+                node_id INT NOT NULL,
+                node_name TEXT,
+                node_path TEXT,
+                vec REAL,
+                trgm REAL,
+                status TEXT NOT NULL,
+                llm_decision BOOLEAN,
+                llm_confidence REAL,
+                reason TEXT,
+                error TEXT,
+                created_at TEXT,
+                updated_at TEXT,
+                approved_at TEXT
+            );
+        """)
     conn.commit()
     print(f"已写入 {len(nodes)} 节点并建立 GIN(trgm)+HNSW(vector) 索引，dim={dim}")
 

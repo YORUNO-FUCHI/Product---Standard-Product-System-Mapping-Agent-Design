@@ -19,6 +19,7 @@ from .batch import BatchJob, process_batch
 from .embedder import st_available
 from .extension import append_extension_record, route_a_reliable, route_b_reliable, suggest_extension
 from .pageindex_mapper import PageIndexMapper
+from .synonym_feedback import MANAGER as SYN_FEEDBACK
 
 MAPPER = None         # Route A
 PI_MAPPER = None      # Route B
@@ -82,6 +83,10 @@ PAGE = r"""<!DOCTYPE html>
  .flow-title{font-size:13px;color:#e2e8f0;font-weight:600}.flow-desc{font-size:12px;color:#94a3b8;margin-top:6px;line-height:1.5}
  .grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}
  .extension{border-color:#f59e0b;background:#221a10}
+ .syn-feedback{border-color:#38bdf8;background:#0b2230}
+ .syn-feedback.pending{border-color:#f59e0b;background:#241a0b}
+ .syn-feedback.approved{border-color:#22c55e;background:#0b2415}
+ .syn-feedback.failed{border-color:#ef4444;background:#2a1111}
  .kv{display:grid;grid-template-columns:120px 1fr;gap:8px 14px;margin-top:14px;font-size:13px}
  .kv .k{color:#94a3b8}.kv .v{color:#e2e8f0}
  .batch-panel{margin-top:28px}
@@ -310,6 +315,77 @@ function renderExtension(ext){
     '<div class="reason">建议理由：'+esc(ext.reason||'-')+'</div></div>';
 }
 
+function synStatusText(status){
+  const map={
+    'unsupported':'当前后端不支持写回',
+    'not_triggered':'未触发',
+    'queued':'已入队，等待 LLM 判断',
+    'running':'LLM 判断中',
+    'pending_review':'LLM 已判断为同义词，等待人工确认',
+    'rejected':'LLM 判断不适合作为同义词',
+    'approved':'已确认并写回 syn_list',
+    'failed':'处理失败',
+    'disabled':'未启用'
+  };
+  return map[status]||status||'-';
+}
+
+function renderSynonymFeedback(fb){
+  if(!fb)return '';
+  if(!fb.triggered && fb.status==='not_triggered')return '';
+  const status=fb.status||'';
+  const cls=status==='approved'?'approved':(status==='failed'||status==='rejected'?'failed':(status==='pending_review'?'pending':''));
+  const task=fb.task_id||'';
+  const decision=fb.llm_decision===true?'是':(fb.llm_decision===false?'否':'-');
+  const approveBtn=fb.can_approve
+    ? '<button style="margin-top:12px" data-task="'+esc(task)+'" onclick="approveSynonymFeedback(this.dataset.task)">确认写回同义词</button>'
+    : '';
+  if(task && (status==='queued'||status==='running')){
+    setTimeout(()=>pollSynonymFeedback(task),1200);
+  }
+  return '<div class="card syn-feedback '+cls+'" id="synFeedbackCard">'+
+    '<h3>同义词反馈环</h3>'+
+    '<div class="path">'+esc(synStatusText(status))+'</div>'+
+    '<div class="kv">'+
+      '<div class="k">触发条件</div><div class="v">pgvector &gt; '+esc(fb.vec_threshold??'0.95')+' 且 pg_trgm = '+esc(fb.trgm_threshold??'0')+'</div>'+
+      '<div class="k">输入产品名</div><div class="v">'+esc(fb.product||'-')+'</div>'+
+      '<div class="k">候选节点</div><div class="v">'+esc(fb.node_name||'-')+'</div>'+
+      '<div class="k">候选路径</div><div class="v">'+esc(fb.node_path||'-')+'</div>'+
+      '<div class="k">pgvector</div><div class="v">'+(fb.vec!=null?Number(fb.vec).toFixed(3):'-')+'</div>'+
+      '<div class="k">pg_trgm</div><div class="v">'+(fb.trgm!=null?Number(fb.trgm).toFixed(3):'-')+'</div>'+
+      '<div class="k">LLM判断</div><div class="v">'+decision+'　置信度 '+(fb.llm_confidence!=null?Number(fb.llm_confidence).toFixed(3):'-')+'</div>'+
+      '<div class="k">任务ID</div><div class="v">'+esc(task||'-')+'</div>'+
+    '</div>'+
+    '<div class="reason">'+esc(fb.reason||fb.message||fb.error||'等待反馈流程更新')+'</div>'+
+    approveBtn+
+    '</div>';
+}
+
+async function pollSynonymFeedback(taskId){
+  if(!taskId)return;
+  try{
+    const r=await fetch('/api/synonym-feedback/status?task_id='+encodeURIComponent(taskId));
+    const d=await r.json();
+    const el=document.getElementById('synFeedbackCard');
+    if(el && !d.error) el.outerHTML=renderSynonymFeedback(d);
+  }catch(e){}
+}
+
+async function approveSynonymFeedback(taskId){
+  if(!taskId)return;
+  const el=document.getElementById('synFeedbackCard');
+  if(el) el.querySelector('button')?.setAttribute('disabled','disabled');
+  try{
+    const r=await fetch('/api/synonym-feedback/approve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({task_id:taskId})});
+    const d=await r.json();
+    const target=document.getElementById('synFeedbackCard');
+    if(target) target.outerHTML=renderSynonymFeedback(d);
+  }catch(e){
+    const target=document.getElementById('synFeedbackCard');
+    if(target) target.insertAdjacentHTML('beforeend','<div class="reason">确认写回失败：'+esc(e)+'</div>');
+  }
+}
+
 function renderHybrid(d){
   const a=d.route_a||{}, b=d.route_b||{}, final=d.final||{};
   let finalHtml='';
@@ -326,6 +402,7 @@ function renderHybrid(d){
     resultCard('Route B · PageIndex', b.result||{}, b.reliable)+
     '</div>'+
     finalHtml+
+    renderSynonymFeedback(d.synonym_feedback)+
     renderExtension(d.extension);
 }
 
@@ -357,7 +434,7 @@ function renderRAG(d){
       '<table><thead><tr><th>候选标准节点</th><th>trgm 字面</th><th>向量 语义</th><th>融合分</th></tr></thead>'+
       '<tbody>'+rows+'</tbody></table></div>';
   }
-  document.getElementById('out').innerHTML=card+table;
+  document.getElementById('out').innerHTML=card+renderSynonymFeedback(d.synonym_feedback)+table;
 }
 
 function renderPageIndex(d){
@@ -523,6 +600,12 @@ class Handler(BaseHTTPRequestHandler):
             }))
         elif parsed.path == "/api/embedder":
             self._send(200, json.dumps({"embedder": CURRENT_EMBEDDER}))
+        elif parsed.path == "/api/synonym-feedback/status":
+            task_id = (parse_qs(parsed.query).get("task_id") or [""])[0]
+            if not task_id:
+                return self._send(400, json.dumps({"error": "empty task_id"}))
+            body = SYN_FEEDBACK.get(task_id)
+            self._send(200 if "error" not in body else 404, json.dumps(body, ensure_ascii=False))
         elif parsed.path == "/api/batch/status":
             job_id = (parse_qs(parsed.query).get("job_id") or [""])[0]
             with BATCH_LOCK:
@@ -548,7 +631,8 @@ class Handler(BaseHTTPRequestHandler):
             if not product:
                 return self._send(400, json.dumps({"error": "empty product"}))
             result, candidates = MAPPER.explain(product)
-            body = json.dumps({"result": result, "candidates": candidates},
+            feedback = SYN_FEEDBACK.maybe_enqueue(product, candidates)
+            body = json.dumps({"result": result, "candidates": candidates, "synonym_feedback": feedback},
                               ensure_ascii=False)
             self._send(200, body)
 
@@ -575,6 +659,7 @@ class Handler(BaseHTTPRequestHandler):
             # Hybrid demo runs both routes so the whole decision process is visible.
             result_a, candidates = MAPPER.explain(product)
             result_b, trace_b = PI_MAPPER.explain(product)
+            feedback = SYN_FEEDBACK.maybe_enqueue(product, candidates)
 
             a_ok = route_a_reliable(result_a)
             b_ok = route_b_reliable(result_b)
@@ -641,8 +726,19 @@ class Handler(BaseHTTPRequestHandler):
                 "extension": extension,
                 "flow_steps": flow_steps,
                 "extension_saved": saved,
+                "synonym_feedback": feedback,
             }, ensure_ascii=False)
             self._send(200, body)
+
+        elif self.path == "/api/synonym-feedback/approve":
+            n = int(self.headers.get("Content-Length", 0))
+            payload = json.loads(self.rfile.read(n) or b"{}")
+            task_id = (payload.get("task_id") or "").strip()
+            if not task_id:
+                return self._send(400, json.dumps({"error": "empty task_id"}))
+            body = SYN_FEEDBACK.approve(task_id, MAPPER)
+            self._send(200 if body.get("status") == "approved" else 400 if "error" in body else 200,
+                       json.dumps(body, ensure_ascii=False))
 
         elif self.path == "/api/method":
             n = int(self.headers.get("Content-Length", 0))

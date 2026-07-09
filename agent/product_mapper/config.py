@@ -39,6 +39,12 @@ DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 # ── Postgres 连接（RECALL_BACKEND=pg 时使用）──────────────────────
 PG_DSN = os.getenv("PG_DSN", "postgresql://postgres:postgres@localhost:5432/taxonomy")
 
+# ── 同义词反馈环：pgvector 高相似 + pg_trgm 零字面 → LLM 判断 → 人工确认写回 ──
+SYN_FEEDBACK_ENABLED = os.getenv("SYN_FEEDBACK_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+SYN_FEEDBACK_VEC_THRESHOLD = float(os.getenv("SYN_FEEDBACK_VEC_THRESHOLD", "0.95"))
+SYN_FEEDBACK_TRGM_THRESHOLD = float(os.getenv("SYN_FEEDBACK_TRGM_THRESHOLD", "0.0"))
+SYN_FEEDBACK_AUTO_APPROVE = os.getenv("SYN_FEEDBACK_AUTO_APPROVE", "false").lower() in {"1", "true", "yes", "on"}
+
 
 def has_llm() -> bool:
     """是否已配置 DeepSeek key（未配置时精排自动降级为按分数选 Top-1）。"""

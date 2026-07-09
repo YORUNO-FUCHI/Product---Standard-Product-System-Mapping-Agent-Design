@@ -36,6 +36,19 @@ class ProductMapper:
                 if key not in self._exact_index:
                     self._exact_index[key] = n
 
+    def add_synonym(self, node_id: int, synonym: str) -> bool:
+        """同步运行时节点与精确匹配索引，供同义词反馈写回后立即生效。"""
+        synonym = (synonym or "").strip()
+        node = self.by_id.get(int(node_id))
+        if not node or not synonym:
+            return False
+        if synonym not in node.synonyms:
+            node.synonyms.append(synonym)
+        key = _norm(synonym)
+        if key not in self._exact_index:
+            self._exact_index[key] = node
+        return True
+
     def set_embedder(self, embedder_type: str) -> float:
         """动态切换 embedder，返回重建耗时（秒）。trigram 索引不重建。"""
         from .embedder import st_available
