@@ -105,7 +105,7 @@ PAGE = r"""<!DOCTYPE html>
  @media(max-width:900px){.batch-controls{grid-template-columns:1fr}}
 </style></head><body><div class="wrap">
  <h1>产品 - 标准产品体系映射智能体</h1>
- <div class="sub" id="subtitle">向量召回（pgvector / ST）→ LLM 精排 → 唯一标准节点</div>
+ <div class="sub" id="subtitle">双路召回（pg_trgm + pgvector）→ LLM 精排 → 唯一标准节点</div>
 
  <!-- 方案切换 -->
  <div class="toggle-row">
@@ -177,7 +177,7 @@ let currentEmb='hash';
 let currentMethod='raga';
 
 const methodDescs = {
-  'raga': 'Route A：向量语义召回（pgvector / ST）→ DeepSeek 精排 → 唯一标准节点',
+  'raga': 'Route A：双路召回（pg_trgm 字面候选 + pgvector 语义候选）→ DeepSeek 精排 → 唯一标准节点',
   'pageindex': 'Route B：LLM 在标准体系树上逐层推理搜索（PageIndex 式），无向量依赖，完整可追溯路径',
   'hybrid': 'Hybrid：同时展示 Route A 与 Route B 判断；双路线都不可靠时进入体系扩展建议',
 };
@@ -457,9 +457,9 @@ function renderRAG(d){
   if(C.length>0){
     let rows=C.map(c=>'<tr class="'+(c.chosen?'sel':'')+'"><td>'+(c.chosen?'[OK] ':'')+c.name+
       '<div class="note">'+c.path+(c.synonyms&&c.synonyms.length?'　·　同义词: '+c.synonyms.join('、'):'')+'</div></td>'+
-      '<td class="num">'+(c.vec!=null?c.vec.toFixed(3):'-')+'</td><td class="num">'+(c.fused!=null?c.fused.toFixed(3):'-')+'</td></tr>').join('');
-    table='<div class="card"><h3>向量召回候选与排序分（Top '+C.length+'）</h3>'+
-      '<table><thead><tr><th>候选标准节点</th><th>向量语义</th><th>排序分</th></tr></thead>'+
+      '<td class="num">'+(c.trgm!=null?c.trgm.toFixed(3):'-')+'</td><td class="num">'+(c.vec!=null?c.vec.toFixed(3):'-')+'</td><td class="num">'+(c.fused!=null?c.fused.toFixed(3):'-')+'</td></tr>').join('');
+    table='<div class="card"><h3>双路召回候选与排序分（Top '+C.length+'）</h3>'+
+      '<table><thead><tr><th>候选标准节点</th><th>pg_trgm 字面</th><th>pgvector 语义</th><th>排序分</th></tr></thead>'+
       '<tbody>'+rows+'</tbody></table></div>';
   }
   document.getElementById('out').innerHTML=card+renderSynonymFeedback(d.synonym_feedback)+table;
