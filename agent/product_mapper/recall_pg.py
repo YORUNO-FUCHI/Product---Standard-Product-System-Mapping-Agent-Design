@@ -1,4 +1,4 @@
-"""召回层（Postgres + pg_trgm + pgvector 后端）——装 Docker 后启用。
+"""召回层（Postgres + pgvector 后端）——装 Docker 后启用。
 
 启用步骤：
   1) cd docker && docker compose up -d          # 起 pgvector 服务
@@ -13,13 +13,16 @@ from .embedder import get_embedder
 
 
 class Candidate:
-    __slots__ = ("node", "trgm", "vec", "fused")
+    __slots__ = ("node", "trgm", "vec", "fused", "lexical_quality", "core_overlap", "core_terms")
 
     def __init__(self, node, trgm=0.0, vec=0.0):
         self.node = node
         self.trgm = trgm
         self.vec = vec
         self.fused = 0.0
+        self.lexical_quality = ""
+        self.core_overlap = False
+        self.core_terms = []
 
 
 class PgRecall:
@@ -30,26 +33,11 @@ class PgRecall:
         self.embedder = get_embedder()
 
     def recall(self, query, k_trgm=None, k_vec=None):
-        k_trgm = k_trgm or config.K_TRGM
         k_vec = k_vec or config.K_VEC
         qv = self.embedder.encode_one(query).tolist()
         merged = {}
 
         with self.conn.cursor() as cur:
-            # 字面路：pg_trgm 相似度（GIN 索引）
-            cur.execute(
-                """
-                SELECT category_id, similarity(search_text, %s) AS s
-                FROM product_taxonomy
-                WHERE search_text %% %s
-                ORDER BY s DESC LIMIT %s
-                """,
-                (query, query, k_trgm),
-            )
-            for cid, s in cur.fetchall():
-                merged.setdefault(cid, Candidate(self.by_id[cid]))
-                merged[cid].trgm = float(s)
-
             # 向量路：pgvector 余弦距离（HNSW 索引），相似度 = 1 - 距离
             cur.execute(
                 """

@@ -35,6 +35,7 @@ K_RERANK = int(os.getenv("K_RERANK", "12"))  # 送给 LLM 精排的候选数
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+LLM_PROXY = os.getenv("LLM_PROXY", "")
 
 # ── Postgres 连接（RECALL_BACKEND=pg 时使用）──────────────────────
 PG_DSN = os.getenv("PG_DSN", "postgresql://postgres:postgres@localhost:5432/taxonomy")

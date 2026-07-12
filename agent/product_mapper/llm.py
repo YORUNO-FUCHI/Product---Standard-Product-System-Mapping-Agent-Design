@@ -53,8 +53,10 @@ def chat_json(system: str, user: str, temperature: float = 0.0, timeout: int = 6
     _LLM_STATS["requests"] += 1
     _LLM_STATS["prompt_chars"] += len(system or "") + len(user or "")
     try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=timeout,
-                             proxies={"http": None, "https": None})
+        kwargs = {}
+        if config.LLM_PROXY:
+            kwargs["proxies"] = {"http": config.LLM_PROXY, "https": config.LLM_PROXY}
+        resp = requests.post(url, headers=headers, json=payload, timeout=timeout, **kwargs)
         resp.raise_for_status()
         data = resp.json()
         usage = data.get("usage") or {}

@@ -68,6 +68,8 @@ def route_b_reliable(result: dict | None) -> bool:
         return False
     source = result.get("source", "")
     confidence = float(result.get("confidence", 0.0) or 0.0)
+    if result.get("lexical_quality") == "noisy" or result.get("core_overlap") is False:
+        return source == "pageindex_exact"
     if source in {"pageindex_exact", "hybrid_pageindex"} and confidence >= 0.85:
         return True
     if source == "pageindex" and confidence >= 0.70:
@@ -87,7 +89,7 @@ def nearest_taxonomy_candidates(mapper: ProductMapper, product: str, top_k: int 
     original_key = config.DEEPSEEK_API_KEY
     config.DEEPSEEK_API_KEY = ""
     try:
-        ordered = _fuse(mapper.recaller.recall(product))[:top_k]
+        ordered = _fuse(mapper.recaller.recall(product), product)[:top_k]
     finally:
         config.DEEPSEEK_API_KEY = original_key
 

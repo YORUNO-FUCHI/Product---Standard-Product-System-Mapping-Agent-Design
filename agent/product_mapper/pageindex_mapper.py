@@ -17,7 +17,8 @@ from collections import Counter
 from . import config
 from .taxonomy import load_nodes, build_json_tree, Node
 from .llm import chat_json
-from .text import similarity as trigram_similarity
+from .text import core_overlap as lexical_core_overlap
+from .text import lexical_quality, similarity as trigram_similarity
 
 
 # ── 系统提示词 ────────────────────────────────────────────────────
@@ -302,6 +303,8 @@ class PageIndexMapper:
             "latency_ms": round((time.time() - t0) * 1000, 1),
             "n_layers_visited": len(trace),
             "trace": trace,
+            "lexical_quality": lexical_quality(product, selected_node.name, trace[-1]["confidence"] if trace else 0.5),
+            "core_overlap": lexical_core_overlap(product, selected_node.name),
         }
 
     def _fallback_trigram(self, product: str, t0: float) -> dict:
@@ -324,7 +327,10 @@ class PageIndexMapper:
                 best_score = score
                 best_node = n
 
-        if best_node and best_score >= 0.18:
+        best_core_overlap = lexical_core_overlap(product, best_node.name) if best_node else False
+        best_quality = lexical_quality(product, best_node.name, best_score) if best_node else ""
+
+        if best_node and best_score >= 0.18 and best_core_overlap and best_quality != "noisy":
             return {
                 "product": product,
                 "node_id": best_node.id,
@@ -335,20 +341,27 @@ class PageIndexMapper:
                 "source": "pageindex_trigram",
                 "latency_ms": round((time.time() - t0) * 1000, 1),
                 "trace": [],
+                "lexical_quality": best_quality,
+                "core_overlap": best_core_overlap,
             }
 
         if best_node and best_score >= 0.08:
+            reason = "Route B 弱匹配候选（无 LLM，需人工复核）"
+            if not best_core_overlap or best_quality == "noisy":
+                reason = "Route B 字面相似但核心词不一致，降为弱匹配候选"
             return {
                 "product": product,
                 "node_id": best_node.id,
                 "name": best_node.name,
                 "path": best_node.path_str,
                 "confidence": round(best_score, 3),
-                "reason": "Route B 弱匹配候选（无 LLM，需人工复核）",
+                "reason": reason,
                 "source": "pageindex_trigram_weak",
                 "latency_ms": round((time.time() - t0) * 1000, 1),
                 "trace": [],
                 "weak_match": True,
+                "lexical_quality": best_quality,
+                "core_overlap": best_core_overlap,
             }
 
         return {

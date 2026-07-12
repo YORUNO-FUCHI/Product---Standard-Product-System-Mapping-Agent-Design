@@ -17,7 +17,8 @@ from . import config
 from .agent import ProductMapper
 from .batch import BatchJob, process_batch
 from .embedder import st_available
-from .extension import append_extension_record, route_a_reliable, route_b_reliable, suggest_extension
+from .extension import append_extension_record
+from .hybrid_decider import choose_hybrid_final
 from .pageindex_mapper import PageIndexMapper
 from .synonym_feedback import MANAGER as SYN_FEEDBACK
 
@@ -104,7 +105,7 @@ PAGE = r"""<!DOCTYPE html>
  @media(max-width:900px){.batch-controls{grid-template-columns:1fr}}
 </style></head><body><div class="wrap">
  <h1>产品 - 标准产品体系映射智能体</h1>
- <div class="sub" id="subtitle">双路召回（trigram + 向量）→ 融合 + LLM 精排 → 唯一标准节点</div>
+ <div class="sub" id="subtitle">向量召回（pgvector / ST）→ LLM 精排 → 唯一标准节点</div>
 
  <!-- 方案切换 -->
  <div class="toggle-row">
@@ -176,7 +177,7 @@ let currentEmb='hash';
 let currentMethod='raga';
 
 const methodDescs = {
-  'raga': 'Route A：双路召回（trigram 字面 + 向量语义）→ 多策略融合 + DeepSeek 精排 → 唯一标准节点',
+  'raga': 'Route A：向量语义召回（pgvector / ST）→ DeepSeek 精排 → 唯一标准节点',
   'pageindex': 'Route B：LLM 在标准体系树上逐层推理搜索（PageIndex 式），无向量依赖，完整可追溯路径',
   'hybrid': 'Hybrid：同时展示 Route A 与 Route B 判断；双路线都不可靠时进入体系扩展建议',
 };
@@ -393,7 +394,10 @@ function renderHybrid(d){
     finalHtml='<div class="card hit"><h3>最终采用路线</h3><div class="path">'+esc(final.route||'-')+'</div>'+
       '<div class="meta"><span>node_id: '+final.node_id+'</span><span>'+esc(final.path||'')+'</span></div></div>';
   }else{
-    finalHtml='<div class="card miss"><h3>最终结果</h3><div class="path g">Route A 与 Route B 均未可靠命中，进入体系扩展流程</div></div>';
+    const missText = d.conflict && d.adjudication && d.adjudication.choice==='neither'
+      ? '大模型仲裁认为 Route A 与 Route B 均不合适，进入体系扩展流程'
+      : 'Route A 与 Route B 均未可靠命中，进入体系扩展流程';
+    finalHtml='<div class="card miss"><h3>最终结果</h3><div class="path g">'+esc(missText)+'</div></div>';
   }
   document.getElementById('out').innerHTML=
     renderFlow(d.flow_steps)+
@@ -401,9 +405,33 @@ function renderHybrid(d){
     resultCard('Route A · RAG', a.result||{}, a.reliable)+
     resultCard('Route B · PageIndex', b.result||{}, b.reliable)+
     '</div>'+
+    renderAdjudication(d.conflict, d.adjudication, a.result||{}, b.result||{})+
     finalHtml+
     renderSynonymFeedback(d.synonym_feedback)+
     renderExtension(d.extension);
+}
+
+function renderAdjudication(conflict, adj, a, b){
+  if(!conflict || !adj || !adj.triggered)return '';
+  const status=adj.status||'-';
+  const choice=adj.choice||'-';
+  const cls=status==='done'?'hit':(status==='failed'?'miss':'warn');
+  const chosen = choice==='A' ? '选择 Route A' :
+    choice==='B' ? '选择 Route B' :
+    choice==='neither' ? '两者都不合适，进入体系扩展' :
+    choice==='fallback_A' ? '降级采用 Route A' : choice;
+  return '<div class="card '+cls+'">'+
+    '<h3>A/B 冲突仲裁</h3>'+
+    '<div class="path">'+esc(chosen)+'</div>'+
+    '<div class="kv">'+
+      '<div class="k">Route A</div><div class="v">'+esc(a.name||'-')+'｜'+esc(a.path||'-')+'</div>'+
+      '<div class="k">Route B</div><div class="v">'+esc(b.name||'-')+'｜'+esc(b.path||'-')+'</div>'+
+      '<div class="k">仲裁状态</div><div class="v">'+esc(status)+'</div>'+
+      '<div class="k">仲裁置信度</div><div class="v">'+(adj.confidence!=null?Number(adj.confidence).toFixed(3):'-')+'</div>'+
+      '<div class="k">是否调用LLM</div><div class="v">'+(adj.llm_used?'是':'否')+'</div>'+
+    '</div>'+
+    '<div class="reason">理由：'+esc(adj.reason||'-')+'</div>'+
+    '</div>';
 }
 
 function renderRAG(d){
@@ -429,9 +457,9 @@ function renderRAG(d){
   if(C.length>0){
     let rows=C.map(c=>'<tr class="'+(c.chosen?'sel':'')+'"><td>'+(c.chosen?'[OK] ':'')+c.name+
       '<div class="note">'+c.path+(c.synonyms&&c.synonyms.length?'　·　同义词: '+c.synonyms.join('、'):'')+'</div></td>'+
-      '<td class="num">'+(c.trgm!=null?c.trgm.toFixed(3):'-')+'</td><td class="num">'+(c.vec!=null?c.vec.toFixed(3):'-')+'</td><td class="num">'+(c.fused!=null?c.fused.toFixed(3):'-')+'</td></tr>').join('');
-    table='<div class="card"><h3>召回候选与融合打分（Top '+C.length+'）</h3>'+
-      '<table><thead><tr><th>候选标准节点</th><th>trgm 字面</th><th>向量 语义</th><th>融合分</th></tr></thead>'+
+      '<td class="num">'+(c.vec!=null?c.vec.toFixed(3):'-')+'</td><td class="num">'+(c.fused!=null?c.fused.toFixed(3):'-')+'</td></tr>').join('');
+    table='<div class="card"><h3>向量召回候选与排序分（Top '+C.length+'）</h3>'+
+      '<table><thead><tr><th>候选标准节点</th><th>向量语义</th><th>排序分</th></tr></thead>'+
       '<tbody>'+rows+'</tbody></table></div>';
   }
   document.getElementById('out').innerHTML=card+renderSynonymFeedback(d.synonym_feedback)+table;
@@ -631,7 +659,7 @@ class Handler(BaseHTTPRequestHandler):
             if not product:
                 return self._send(400, json.dumps({"error": "empty product"}))
             result, candidates = MAPPER.explain(product)
-            feedback = SYN_FEEDBACK.maybe_enqueue(product, candidates)
+            feedback = SYN_FEEDBACK.maybe_enqueue(product, candidates, MAPPER)
             body = json.dumps({"result": result, "candidates": candidates, "synonym_feedback": feedback},
                               ensure_ascii=False)
             self._send(200, body)
@@ -659,32 +687,15 @@ class Handler(BaseHTTPRequestHandler):
             # Hybrid demo runs both routes so the whole decision process is visible.
             result_a, candidates = MAPPER.explain(product)
             result_b, trace_b = PI_MAPPER.explain(product)
-            feedback = SYN_FEEDBACK.maybe_enqueue(product, candidates)
+            feedback = SYN_FEEDBACK.maybe_enqueue(product, candidates, MAPPER)
 
-            a_ok = route_a_reliable(result_a)
-            b_ok = route_b_reliable(result_b)
-            extension = None
+            decision = choose_hybrid_final(product, result_a, result_b, MAPPER, use_llm=True)
+            a_ok = decision["a_ok"]
+            b_ok = decision["b_ok"]
+            extension = decision["extension"]
+            final = decision["final"]
             saved = False
-            if a_ok:
-                final = {
-                    "route": "Route A",
-                    "node_id": result_a.get("node_id"),
-                    "name": result_a.get("name"),
-                    "path": result_a.get("path"),
-                    "confidence": result_a.get("confidence", 0),
-                    "source": result_a.get("source", ""),
-                }
-            elif b_ok:
-                final = {
-                    "route": "Route B",
-                    "node_id": result_b.get("node_id"),
-                    "name": result_b.get("name"),
-                    "path": result_b.get("path"),
-                    "confidence": result_b.get("confidence", 0),
-                    "source": result_b.get("source", ""),
-                }
-            else:
-                extension = suggest_extension(product, MAPPER, result_a, result_b, use_llm=True)
+            if extension:
                 try:
                     append_extension_record(extension)
                     extension["saved"] = True
@@ -692,14 +703,6 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception as e:
                     extension["saved"] = False
                     extension["save_error"] = str(e)
-                final = {
-                    "route": "体系扩展",
-                    "node_id": None,
-                    "name": None,
-                    "path": None,
-                    "confidence": 0.0,
-                    "source": "extension",
-                }
 
             flow_steps = [
                 {"title": "输入产品名", "desc": product, "status": "done"},
@@ -713,17 +716,26 @@ class Handler(BaseHTTPRequestHandler):
                     "desc": "可靠命中" if b_ok else ("弱命中/待复核" if result_b.get("node_id") else "未命中"),
                     "status": "done" if b_ok else "warn",
                 },
-                {
-                    "title": "最终流向",
-                    "desc": f"采用 {final['route']}" if final.get("node_id") else "进入体系扩展建议",
-                    "status": "done" if final.get("node_id") else "stop",
-                },
             ]
+            if decision["conflict"]:
+                adj = decision["adjudication"]
+                flow_steps.append({
+                    "title": "A/B冲突仲裁",
+                    "desc": adj.get("reason") or adj.get("choice") or "已触发仲裁",
+                    "status": "done" if adj.get("status") == "done" else "warn",
+                })
+            flow_steps.append({
+                "title": "最终流向",
+                "desc": f"采用 {final['route']}" if final.get("node_id") else "进入体系扩展建议",
+                "status": "done" if final.get("node_id") else "stop",
+            })
             body = json.dumps({
                 "route_a": {"result": result_a, "candidates": candidates, "reliable": a_ok},
                 "route_b": {"result": result_b, "trace": trace_b, "reliable": b_ok},
                 "final": final,
                 "extension": extension,
+                "conflict": decision["conflict"],
+                "adjudication": decision["adjudication"],
                 "flow_steps": flow_steps,
                 "extension_saved": saved,
                 "synonym_feedback": feedback,

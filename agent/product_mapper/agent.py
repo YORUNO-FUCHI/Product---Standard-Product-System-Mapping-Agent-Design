@@ -74,6 +74,8 @@ class ProductMapper:
             "source": "exact_match",
             "latency_ms": round((time.time() - t0) * 1000, 1),
             "n_candidates": 1,
+            "lexical_quality": "strong",
+            "core_overlap": True,
         }
 
     def map(self, product: str, topk_candidates: int = None, verbose: bool = False):
@@ -105,7 +107,7 @@ class ProductMapper:
         exact = self._exact_index.get(_norm(product))
         if exact is not None:
             cands = self.recaller.recall(product)
-            ordered = _fuse(cands)[:config.K_RERANK]
+            ordered = _fuse(cands, product)[:config.K_RERANK]
             result = self._exact_result(product, exact, t0,
                                         f"精确匹配：产品名与节点「{exact.name}」一致")
             result["n_candidates"] = len(cands)
@@ -113,6 +115,9 @@ class ProductMapper:
                 "id": c.node.id, "name": c.node.name, "path": c.node.path_str,
                 "trgm": round(c.trgm, 3), "vec": round(c.vec, 3),
                 "fused": round(c.fused, 3), "synonyms": c.node.synonyms[:6],
+                "lexical_quality": c.lexical_quality,
+                "core_overlap": c.core_overlap,
+                "core_terms": c.core_terms,
                 "chosen": (c.node.id == exact.id),
             } for c in ordered]
             return result, cand_list
@@ -127,6 +132,9 @@ class ProductMapper:
             "id": c.node.id, "name": c.node.name, "path": c.node.path_str,
             "trgm": round(c.trgm, 3), "vec": round(c.vec, 3),
             "fused": round(c.fused, 3), "synonyms": c.node.synonyms[:6],
+            "lexical_quality": c.lexical_quality,
+            "core_overlap": c.core_overlap,
+            "core_terms": c.core_terms,
             "chosen": (c.node.id == result["node_id"]),
         } for c in view]
         return result, cand_list

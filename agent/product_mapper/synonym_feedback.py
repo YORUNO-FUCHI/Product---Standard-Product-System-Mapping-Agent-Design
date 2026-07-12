@@ -83,7 +83,7 @@ class SynonymFeedbackManager:
             self.db_ready = False
             self.db_error = str(e)
 
-    def maybe_enqueue(self, product: str, candidates: list[dict]) -> dict:
+    def maybe_enqueue(self, product: str, candidates: list[dict], mapper=None) -> dict:
         base = {
             "enabled": config.SYN_FEEDBACK_ENABLED,
             "supported": self.supported,
@@ -126,6 +126,7 @@ class SynonymFeedbackManager:
             "llm_confidence": 0.0,
             "reason": "",
             "error": "",
+            "mapper": mapper,
             "created_at": now_iso(),
             "updated_at": now_iso(),
             "approved_at": "",
@@ -223,7 +224,22 @@ class SynonymFeedbackManager:
             task["llm_decision"] = decision
             task["llm_confidence"] = float(out.get("confidence", 0.0) or 0.0)
             task["reason"] = str(out.get("reason", "") or "")
-            task["status"] = "pending_review" if decision else "rejected"
+            if decision and config.SYN_FEEDBACK_AUTO_APPROVE:
+                mapper = task.get("mapper")
+                if mapper is None:
+                    task["status"] = "failed"
+                    task["error"] = "自动写回失败：缺少运行时 mapper"
+                else:
+                    try:
+                        self._write_back(task, mapper)
+                        task["status"] = "approved"
+                        task["approved_at"] = now_iso()
+                        task["reason"] = (task["reason"] + "；LLM 通过，已自动写回 syn_list").strip("；")
+                    except Exception as e:
+                        task["status"] = "failed"
+                        task["error"] = f"自动写回失败：{e}"
+            else:
+                task["status"] = "pending_review" if decision else "rejected"
         task["updated_at"] = now_iso()
         self._upsert_db(task)
         with self.lock:
@@ -364,6 +380,7 @@ class SynonymFeedbackManager:
             "llm_confidence": float(task.get("llm_confidence", 0.0) or 0.0),
             "reason": task.get("reason", ""),
             "error": task.get("error", ""),
+            "auto_approve": config.SYN_FEEDBACK_AUTO_APPROVE,
             "can_approve": task.get("status") == "pending_review" and task.get("llm_decision") is True,
             "message": task.get("error") or task.get("reason") or "",
         }

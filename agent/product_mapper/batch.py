@@ -13,8 +13,8 @@ from .extension import (
     append_extension_record,
     route_a_reliable,
     route_b_reliable,
-    suggest_extension,
 )
+from .hybrid_decider import choose_hybrid_final
 
 
 PRODUCT_COLUMN_CANDIDATES = ["清洗后名称", "产品名", "product_name", "name"]
@@ -24,6 +24,7 @@ DETAIL_HEADERS = [
     "原始行号", "拆分序号", "原始产品串", "拆分后产品名",
     "Route A状态", "Route A是否可靠", "A_node_id", "A_name", "A_path", "A_confidence", "A_source", "A_latency_ms",
     "Route B状态", "Route B是否可靠", "B_node_id", "B_name", "B_path", "B_confidence", "B_source", "B_latency_ms",
+    "是否A/B可靠冲突", "是否触发仲裁", "仲裁选择", "仲裁置信度", "仲裁理由", "仲裁是否使用LLM",
     "最终采用路线", "最终node_id", "最终name", "最终path", "最终confidence",
     "是否进入体系扩展", "建议动作", "建议新增节点名", "建议父节点node_id", "建议父节点路径",
     "建议同义词", "建议理由", "优先级", "复核状态", "错误信息",
@@ -46,7 +47,17 @@ class BatchJob:
         self.status = "waiting"
         self.total = 0
         self.processed = 0
-        self.stats = {"a_hits": 0, "b_hits": 0, "extensions": 0, "errors": 0}
+        self.stats = {
+            "a_hits": 0,
+            "b_hits": 0,
+            "extensions": 0,
+            "errors": 0,
+            "conflicts": 0,
+            "adjudications": 0,
+            "adjudicate_a": 0,
+            "adjudicate_b": 0,
+            "adjudicate_neither": 0,
+        }
         self.preview: list[dict] = []
         self.error = ""
         self.started_at = None
@@ -171,23 +182,44 @@ def process_batch(job: BatchJob, mapper, pageindex_mapper,
                     b_ok = route_b_reliable(result_b)
                     use_llm = bool(original_key)
 
-                extension = None
-                if a_ok:
-                    final_route, final = "Route A", result_a
-                    job.stats["a_hits"] += 1
-                elif b_ok:
-                    final_route, final = "Route B", result_b
-                    job.stats["b_hits"] += 1
-                else:
-                    extension = suggest_extension(product, mapper, result_a, result_b, use_llm=use_llm)
+                decision = choose_hybrid_final(product, result_a, result_b, mapper, use_llm=use_llm)
+                a_ok = decision["a_ok"]
+                b_ok = decision["b_ok"]
+                extension = decision["extension"]
+                final = decision["final"]
+                final_route = final.get("route", "")
+                adjudication = decision["adjudication"]
+
+                if decision["conflict"]:
+                    job.stats["conflicts"] += 1
+                if adjudication.get("triggered"):
+                    job.stats["adjudications"] += 1
+                    choice = adjudication.get("choice")
+                    if choice in {"A", "fallback_A"}:
+                        job.stats["adjudicate_a"] += 1
+                    elif choice == "B":
+                        job.stats["adjudicate_b"] += 1
+                    elif choice == "neither":
+                        job.stats["adjudicate_neither"] += 1
+
+                if extension:
                     append_extension_record(extension)
                     extensions.append(extension)
-                    final_route, final = "体系扩展", {}
                     job.stats["extensions"] += 1
+                elif final_route in {"Route A", "Hybrid仲裁-Route A", "仲裁失败/降级采用Route A"}:
+                    job.stats["a_hits"] += 1
+                elif final_route in {"Route B", "Hybrid仲裁-Route B"}:
+                    job.stats["b_hits"] += 1
 
                 row.update(flatten_result(result_a, "A", a_ok))
                 row.update(flatten_result(result_b, "B", b_ok))
                 row.update({
+                    "是否A/B可靠冲突": "是" if decision["conflict"] else "否",
+                    "是否触发仲裁": "是" if adjudication.get("triggered") else "否",
+                    "仲裁选择": adjudication.get("choice", ""),
+                    "仲裁置信度": adjudication.get("confidence", ""),
+                    "仲裁理由": adjudication.get("reason", ""),
+                    "仲裁是否使用LLM": "是" if adjudication.get("llm_used") else "否",
                     "最终采用路线": final_route,
                     "最终node_id": final.get("node_id", ""),
                     "最终name": final.get("name", ""),
@@ -278,6 +310,11 @@ def write_result_workbook(job: BatchJob, details: list[dict], extensions: list[d
         ("已处理", job.processed),
         ("Route A可靠命中数", job.stats["a_hits"]),
         ("Route B可靠命中数", job.stats["b_hits"]),
+        ("A/B可靠冲突数", job.stats["conflicts"]),
+        ("仲裁调用数", job.stats["adjudications"]),
+        ("仲裁选择A数量", job.stats["adjudicate_a"]),
+        ("仲裁选择B数量", job.stats["adjudicate_b"]),
+        ("仲裁判定都不合适数量", job.stats["adjudicate_neither"]),
         ("体系扩展数", job.stats["extensions"]),
         ("错误数", job.stats["errors"]),
         ("开始时间", job.started_at),

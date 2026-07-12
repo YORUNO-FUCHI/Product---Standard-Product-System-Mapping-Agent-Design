@@ -1,6 +1,6 @@
-"""精排层：多策略融合 + LLM 判断，从候选中选出唯一标准节点。
+"""精排层：向量候选排序 + LLM 判断，从候选中选出唯一标准节点。
 
-- 融合分数 = 归一化(trgm) + 归一化(vec)，用于排序、LLM 缺失时的兜底。
+- 排序分数 = 向量相似度，用于排序、LLM 缺失时的兜底。
 - LLM 判断：把产品 + 候选（含完整路径与同义词）交给 DeepSeek，返回
   {node_id, confidence, reason}；若都不合适返回 node_id=null（供体系扩展子题）。
 """
@@ -16,14 +16,15 @@ SYSTEM = (
 )
 
 
-def _fuse(cands):
-    """按归一化融合分排序，返回排序后的候选列表。"""
+def _fuse(cands, product: str = ""):
+    """Route A 不再使用字面分，按向量相似度排序。"""
     if not cands:
         return []
-    tmax = max((c.trgm for c in cands), default=0.0) or 1.0
-    vmax = max((c.vec for c in cands), default=0.0) or 1.0
     for c in cands:
-        c.fused = c.trgm / tmax + c.vec / vmax
+        c.lexical_quality = "vector_only"
+        c.core_overlap = ""
+        c.core_terms = []
+        c.fused = max(0.0, min(float(c.vec or 0.0), 1.0))
     return sorted(cands, key=lambda c: c.fused, reverse=True)
 
 
@@ -39,7 +40,7 @@ def _format_candidates(cands):
 def rerank(product, cands, k_rerank=None):
     """返回 dict：{node_id, name, path, confidence, reason, source}。"""
     k_rerank = k_rerank or config.K_RERANK
-    ordered = _fuse(cands)[:k_rerank]
+    ordered = _fuse(cands, product)[:k_rerank]
     if not ordered:
         return {"node_id": None, "name": None, "path": None,
                 "confidence": 0.0, "reason": "无候选", "source": "empty"}
@@ -54,13 +55,18 @@ def rerank(product, cands, k_rerank=None):
         if out and "node_id" in out:
             nid = out.get("node_id")
             node = by_id.get(nid) if nid is not None else None
+            chosen = next((c for c in ordered if c.node.id == nid), None)
+            confidence = float(out.get("confidence", 0.0) or 0.0)
+            reason = out.get("reason", "")
             return {
                 "node_id": nid if node else None,
                 "name": node.name if node else None,
                 "path": node.path_str if node else None,
-                "confidence": float(out.get("confidence", 0.0) or 0.0),
-                "reason": out.get("reason", ""),
+                "confidence": confidence,
+                "reason": reason,
                 "source": "llm",
+                "lexical_quality": getattr(chosen, "lexical_quality", ""),
+                "core_overlap": getattr(chosen, "core_overlap", False),
             }
 
     # 兜底：融合分 Top-1
@@ -69,7 +75,9 @@ def rerank(product, cands, k_rerank=None):
         "node_id": top.node.id,
         "name": top.node.name,
         "path": top.node.path_str,
-        "confidence": round(min(top.fused / 2, 1.0), 3),
-        "reason": "LLM 未启用，按 trgm+向量融合分选 Top-1",
+        "confidence": round(max(0.0, min(top.fused, 1.0)), 3),
+        "reason": "LLM 未启用，按向量相似度选 Top-1",
         "source": "fusion",
+        "lexical_quality": top.lexical_quality,
+        "core_overlap": top.core_overlap,
     }
