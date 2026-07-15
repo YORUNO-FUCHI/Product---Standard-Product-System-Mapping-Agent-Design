@@ -29,9 +29,19 @@ class Node:
         return " > ".join(self.path_names)
 
     def search_text(self) -> str:
-        """用于向量编码 / 字面匹配的综合文本。"""
+        """用于字面匹配 / trigram / 语义门槛的综合文本（含路径上下文）。"""
         parts = [self.name] + self.synonyms + self.path_names[:-1]
         return " ".join(parts)
+
+    def embed_text(self) -> str:
+        """用于向量召回的编码文本：名称 + 同义词，**不含路径**。
+
+        路径上下文会稀释核心产品词的向量（如「笔记本电脑 产业链 新型显示」中
+        '产业链/新型显示' 拉低与「笔记本电脑」类查询的相似度）。去路径后节点向量
+        聚焦产品本体，与"产品名"查询形态对齐；标注集实测中位名次 13→7、top10 47%→53%。
+        """
+        parts = [self.name] + self.synonyms
+        return " ".join(p for p in parts if p)
 
 
 def _parse_synonyms(raw) -> list:

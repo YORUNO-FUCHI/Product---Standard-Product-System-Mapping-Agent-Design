@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from . import config
-from .extension import route_a_reliable, route_b_reliable, suggest_extension
+from .extension import route_a_reliable, route_b_reliable, semantic_sim, suggest_extension
 from .llm import chat_json
 
 
@@ -109,6 +109,9 @@ def _final_from(route: str, result: dict) -> dict:
 def choose_hybrid_final(product: str, result_a: dict, result_b: dict,
                         mapper, use_llm: bool = True) -> dict:
     """返回 Hybrid 最终决策、冲突仲裁信息和必要的体系扩展建议。"""
+    # 预存 Route B 的 bge 语义分，供 route_b_reliable 以"语义为主"判定可靠性
+    if result_b is not None and "semantic_sim" not in result_b:
+        result_b["semantic_sim"] = semantic_sim(mapper, product, result_b)
     a_ok = route_a_reliable(result_a)
     b_ok = route_b_reliable(result_b)
     conflict = has_conflict(result_a, result_b, a_ok, b_ok)

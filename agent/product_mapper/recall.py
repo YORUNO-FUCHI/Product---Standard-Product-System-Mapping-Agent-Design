@@ -1,13 +1,15 @@
-"""召回层（内存后端）：Route A 只使用向量语义召回。
+"""召回层（内存后端）：双路召回 = trigram 字面 ∪ 向量语义。
 
-字面 trigram / pg_trgm 不再参与 Route A 候选召回，避免局部词相似造成误召回。
+trigram 只负责扩充候选池；最终排序/兜底不让字面分单独主导。
 """
 import time
+from collections import defaultdict
 
 import numpy as np
 
 from . import config
 from .embedder import get_embedder
+from .text import trigrams
 
 
 class Candidate:
@@ -33,8 +35,20 @@ class MemoryRecall:
 
     def _build(self):
         t0 = time.time()
-        # 向量矩阵
-        texts = [n.search_text() for n in self.nodes]
+        # trigram 倒排索引（和 embedder 无关，只建一次）
+        self._node_trisets = []
+        self._inverted = defaultdict(list)
+        for i, n in enumerate(self.nodes):
+            names = [n.name] + n.synonyms
+            tset = set()
+            for nm in names:
+                tset |= trigrams(nm)
+            self._node_trisets.append(tset)
+            for tg in tset:
+                self._inverted[tg].append(i)
+
+        # 向量矩阵（用 embed_text：名称+同义词，去路径稀释）
+        texts = [n.embed_text() for n in self.nodes]
         self._emb = self.embedder.encode(texts)
         self.build_seconds = time.time() - t0
 
@@ -49,7 +63,7 @@ class MemoryRecall:
             self.embedder, self._emb = self._emb_cache[embedder_type]
         else:
             self.embedder = get_embedder(embedder_type)
-            texts = [n.search_text() for n in self.nodes]
+            texts = [n.embed_text() for n in self.nodes]
             self._emb = self.embedder.encode(texts)
         return time.time() - t0
 
@@ -64,9 +78,29 @@ class MemoryRecall:
             idxs = idxs[np.argsort(-sims[idxs])]
         return [(int(i), float(sims[i])) for i in idxs]
 
+    # ── 字面召回 ────────────────────────────────────────────────
+    def _recall_trgm(self, query, k):
+        q = trigrams(query)
+        if not q:
+            return []
+        shared = defaultdict(int)
+        for tg in q:
+            for idx in self._inverted.get(tg, ()):
+                shared[idx] += 1
+        scored = []
+        for idx, inter in shared.items():
+            union = len(q | self._node_trisets[idx])
+            scored.append((idx, inter / union if union else 0.0))
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return scored[:k]
+
     def recall(self, query, k_trgm=None, k_vec=None):
+        k_trgm = k_trgm or config.K_TRGM
         k_vec = k_vec or config.K_VEC
         merged = {}
+        for idx, s in self._recall_trgm(query, k_trgm):
+            merged.setdefault(idx, Candidate(self.nodes[idx]))
+            merged[idx].trgm = s
         for idx, s in self._recall_vec(query, k_vec):
             merged.setdefault(idx, Candidate(self.nodes[idx]))
             merged[idx].vec = s

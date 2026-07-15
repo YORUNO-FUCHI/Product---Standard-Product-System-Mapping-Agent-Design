@@ -1,37 +1,6 @@
-"""零依赖 Web 演示服务：输入产品 → 可视化映射结果。
-支持三种方案切换：Route A (RAG+LLM) / Route B (PageIndex) / Hybrid (A→B fallback)
-支持 Embedder 切换：Hash / ST
-
-运行：  python -m product_mapper.server
-然后浏览器打开：  http://localhost:8000
-"""
-import base64
-import json
-import threading
-import uuid
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
-from urllib.parse import parse_qs, urlparse
-
-from . import config
-from .agent import ProductMapper
-from .batch import BatchJob, process_batch
-from .embedder import st_available
-from .extension import append_extension_record
-from .hybrid_decider import choose_hybrid_final
-from .pageindex_mapper import PageIndexMapper
-from .synonym_feedback import MANAGER as SYN_FEEDBACK
-
-MAPPER = None         # Route A
-PI_MAPPER = None      # Route B
-CURRENT_EMBEDDER = None
-CURRENT_METHOD = "raga"  # "raga" | "pageindex" | "hybrid"
-BATCH_JOBS = {}
-BATCH_LOCK = threading.Lock()
-BATCH_DIR = config.CACHE_DIR / "batch_jobs"
-
-PAGE = r"""<!DOCTYPE html>
-<html lang="zh-CN"><head><meta charset="utf-8">
+<!DOCTYPE html>
+<!-- saved from url=(0022)http://localhost:8000/ -->
+<html lang="zh-CN"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>产品 - 标准体系映射智能体</title>
 <style>
@@ -105,15 +74,15 @@ PAGE = r"""<!DOCTYPE html>
  @media(max-width:900px){.batch-controls{grid-template-columns:1fr}}
 </style></head><body><div class="wrap">
  <h1>产品 - 标准产品体系映射智能体</h1>
- <div class="sub" id="subtitle">双路召回（pg_trgm + pgvector）→ LLM 精排 → 唯一标准节点</div>
+ <div class="sub" id="subtitle">Hybrid：同时展示 Route A 与 Route B 判断；双路线都不可靠时进入体系扩展建议</div>
 
  <!-- 方案切换 -->
  <div class="toggle-row">
    <span class="toggle-label">匹配方案：</span>
    <div class="toggle-group" id="methodToggle">
-     <button class="toggle-btn active" data-method="raga" onclick="switchMethod('raga')">Route A · RAG</button>
-     <button class="toggle-btn" data-method="pageindex" onclick="switchMethod('pageindex')">Route B · PageIndex</button>
-     <button class="toggle-btn" data-method="hybrid" onclick="switchMethod('hybrid')">Hybrid · A+B</button>
+     <button class="toggle-btn" data-method="raga" onclick="switchMethod(&#39;raga&#39;)">Route A · RAG</button>
+     <button class="toggle-btn" data-method="pageindex" onclick="switchMethod(&#39;pageindex&#39;)">Route B · PageIndex</button>
+     <button class="toggle-btn active" data-method="hybrid" onclick="switchMethod(&#39;hybrid&#39;)">Hybrid · A+B</button>
    </div>
    <span class="toggle-note" id="methodNote"></span>
  </div>
@@ -122,19 +91,19 @@ PAGE = r"""<!DOCTYPE html>
  <div class="toggle-row" id="embedderRow">
    <span class="toggle-label">向量模型：</span>
    <div class="toggle-group" id="toggle">
-     <button class="toggle-btn active" data-emb="hash" onclick="switchEmb('hash')">哈希 (Hash)</button>
-     <button class="toggle-btn" data-emb="st" onclick="switchEmb('st')">语义 (ST)</button>
+     <button class="toggle-btn" data-emb="hash" onclick="switchEmb(&#39;hash&#39;)">哈希 (Hash)</button>
+     <button class="toggle-btn active" data-emb="st" onclick="switchEmb(&#39;st&#39;)">语义 (ST)</button>
    </div>
    <span class="toggle-note" id="embNote"></span>
  </div>
 
  <div class="bar">
-   <input id="q" placeholder="输入一个产品名，如：苞米、华为Matebook X Pro、隆基绿能光伏板" autofocus>
+   <input id="q" placeholder="输入一个产品名，如：苞米、华为Matebook X Pro、隆基绿能光伏板" autofocus="">
    <button id="go" onclick="run()">映射</button>
  </div>
- <div class="chips" id="chips"></div>
- <div class="load" id="load">[加载中] 正在匹配…</div>
- <div id="out"></div>
+ <div class="chips" id="chips"><span class="chip">苞米</span><span class="chip">独头蒜</span><span class="chip">Vigna radiata</span><span class="chip">红富士苹果</span><span class="chip">笔记本电脑</span><span class="chip">工业机器人</span><span class="chip">华为Matebook X Pro</span><span class="chip">大疆无人机Mavic 3</span><span class="chip">特斯拉Model 3电池包</span><span class="chip">XYZ999999</span><span class="chip">火星地产会员卡</span></div>
+ <div class="load" id="load" style="display: none;">[加载中] 正在匹配…</div>
+ <div id="out"><div class="flow"><div class="flow-step done"><div class="flow-title">输入产品名</div><div class="flow-desc">华为Matebook X Pro</div></div><div class="flow-step warn"><div class="flow-title">Route A 判断</div><div class="flow-desc">未命中</div></div><div class="flow-step warn"><div class="flow-title">Route B 判断</div><div class="flow-desc">弱命中/待复核</div></div><div class="flow-step stop"><div class="flow-title">最终流向</div><div class="flow-desc">进入体系扩展建议</div></div></div><div class="grid"><div class="card miss"><h3>Route A · RAG · 未命中</h3><div class="path g">没有找到可直接接受的标准节点</div><div class="meta"><span class="badge b-llm">LLM 精排</span><span>node_id: -</span><span>置信度 0.000</span><span>耗时 2455.9 ms</span></div><div class="reason">理由：华为Matebook X Pro是一款笔记本电脑，候选节点中无对应分类，如笔记本电脑或便携式计算机。</div></div><div class="card miss"><h3>Route B · PageIndex · 弱命中 / 待复核</h3><div class="path">机械、设备类产品<span class="arrow">/</span>通信设备、计算机及其他电子设备<span class="arrow">/</span>电子计算机及其部件<span class="arrow">/</span>电子计算机整机<span class="arrow">/</span><span class="leaf">微型计算机设备</span></div><div class="meta"><span class="badge b-pageindex">PageIndex 树搜索</span><span>node_id: 12667</span><span>置信度 0.950</span><span>耗时 11130.7 ms</span></div><div class="conf"><i style="width:95%"></i></div><div class="reason">理由：[机械、设备类产品](华为Matebook X Pro是一款笔记本电脑，属于电子设备，最接近机械、设备类产品。) &gt; [通信设备、计算机及其他电子设备](华为Matebook X Pro是一款笔记本电脑，属于计算机设备，应归入通信设备、计算机及其他电子设备类别。) &gt; [电子计算机及其部件](华为Matebook X Pro是一款笔记本电脑，属于电子计算机及其部件。) &gt; [电子计算机整机](华为Matebook X Pro是一款笔记本电脑，属于电子计算机整机，而非数字式处理部件。) &gt; [微型计算机设备](华为Matebook X Pro是一款笔记本电脑，属于个人计算机设备，与微型计算机设备节点匹配。)</div></div></div><div class="card miss"><h3>最终结果</h3><div class="path g">Route A 与 Route B 均未可靠命中，进入体系扩展流程</div></div><div class="card syn-feedback " id="synFeedbackCard"><h3>同义词反馈环</h3><div class="path">当前后端不支持写回</div><div class="kv"><div class="k">触发条件</div><div class="v">pgvector &gt; 0.95 且 pg_trgm = 0</div><div class="k">输入产品名</div><div class="v">-</div><div class="k">候选节点</div><div class="v">-</div><div class="k">候选路径</div><div class="v">-</div><div class="k">pgvector</div><div class="v">-</div><div class="k">pg_trgm</div><div class="v">-</div><div class="k">LLM判断</div><div class="v">-　置信度 -</div><div class="k">任务ID</div><div class="v">-</div></div><div class="reason">当前为 memory 后端，只有 Postgres 后端支持写回 syn_list</div></div><div class="card extension"><h3>体系扩展建议</h3><div class="path">新增叶子节点</div><div class="kv"><div class="k">建议新增节点</div><div class="v">笔记本电脑</div><div class="k">建议父节点</div><div class="v">机械、设备类产品 &gt; 通信设备、计算机及其他电子设备 &gt; 电子计算机外部设备及装置 &gt; 终端显示设备 &gt; 显示器</div><div class="k">父节点ID</div><div class="v">21689</div><div class="k">建议同义词</div><div class="v">华为Matebook X Pro</div><div class="k">最接近候选</div><div class="v">机械、设备类产品 &gt; 通信设备、计算机及其他电子设备 &gt; 电子计算机外部设备及装置 &gt; 终端显示设备 &gt; 显示器 &gt; 平板电脑显卡</div><div class="k">优先级</div><div class="v">高</div><div class="k">复核状态</div><div class="v">待复核</div><div class="k">保存结果</div><div class="v">已写入 cache/extension_suggestions</div></div><div class="reason">建议理由：产品为笔记本电脑，属于计算机设备，但现有节点无对应分类，建议在显示器下新增叶子节点。</div></div></div>
 
  <div class="card batch-panel">
    <h3>批量导入处理</h3>
@@ -147,7 +116,7 @@ PAGE = r"""<!DOCTYPE html>
      <div class="field">
        <label>处理模式</label>
        <select id="batchMode">
-         <option value="local" selected>本地低成本</option>
+         <option value="local" selected="">本地低成本</option>
          <option value="full">Hybrid完整演示</option>
          <option value="sampled">抽样LLM</option>
        </select>
@@ -594,280 +563,4 @@ function downloadBatch(){
 }
  getState();
 </script>
-</body></html>"""
-
-
-class Handler(BaseHTTPRequestHandler):
-    def _send(self, code, body, ctype="application/json"):
-        data = body if isinstance(body, bytes) else body.encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", f"{ctype}; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-
-    def _send_file(self, path: Path):
-        if not path.exists():
-            return self._send(404, json.dumps({"error": "file not found"}))
-        data = path.read_bytes()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        self.send_header("Content-Disposition", f'attachment; filename="{path.name}"')
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-
-    def do_GET(self):
-        parsed = urlparse(self.path)
-        if parsed.path in ("/", "/index.html"):
-            self._send(200, PAGE, "text/html")
-        elif parsed.path == "/api/state":
-            self._send(200, json.dumps({
-                "embedder": CURRENT_EMBEDDER,
-                "method": CURRENT_METHOD,
-            }))
-        elif parsed.path == "/api/embedder":
-            self._send(200, json.dumps({"embedder": CURRENT_EMBEDDER}))
-        elif parsed.path == "/api/synonym-feedback/status":
-            task_id = (parse_qs(parsed.query).get("task_id") or [""])[0]
-            if not task_id:
-                return self._send(400, json.dumps({"error": "empty task_id"}))
-            body = SYN_FEEDBACK.get(task_id)
-            self._send(200 if "error" not in body else 404, json.dumps(body, ensure_ascii=False))
-        elif parsed.path == "/api/batch/status":
-            job_id = (parse_qs(parsed.query).get("job_id") or [""])[0]
-            with BATCH_LOCK:
-                job = BATCH_JOBS.get(job_id)
-                body = job.to_dict() if job else {"error": "job not found"}
-            self._send(200 if job else 404, json.dumps(body, ensure_ascii=False))
-        elif parsed.path == "/api/batch/download":
-            job_id = (parse_qs(parsed.query).get("job_id") or [""])[0]
-            with BATCH_LOCK:
-                job = BATCH_JOBS.get(job_id)
-                result_path = job.result_path if job else None
-            if not job:
-                return self._send(404, json.dumps({"error": "job not found"}))
-            self._send_file(result_path)
-        else:
-            self._send(404, json.dumps({"error": "not found"}))
-
-    def do_POST(self):
-        if self.path == "/api/map":
-            n = int(self.headers.get("Content-Length", 0))
-            payload = json.loads(self.rfile.read(n) or b"{}")
-            product = (payload.get("product") or "").strip()
-            if not product:
-                return self._send(400, json.dumps({"error": "empty product"}))
-            result, candidates = MAPPER.explain(product)
-            feedback = SYN_FEEDBACK.maybe_enqueue(product, candidates, MAPPER)
-            body = json.dumps({"result": result, "candidates": candidates, "synonym_feedback": feedback},
-                              ensure_ascii=False)
-            self._send(200, body)
-
-        elif self.path == "/api/pageindex":
-            n = int(self.headers.get("Content-Length", 0))
-            payload = json.loads(self.rfile.read(n) or b"{}")
-            product = (payload.get("product") or "").strip()
-            if not product:
-                return self._send(400, json.dumps({"error": "empty product"}))
-            result, trace = PI_MAPPER.explain(product)
-            body = json.dumps({
-                "result": result,
-                "trace": trace,
-            }, ensure_ascii=False)
-            self._send(200, body)
-
-        elif self.path == "/api/hybrid":
-            n = int(self.headers.get("Content-Length", 0))
-            payload = json.loads(self.rfile.read(n) or b"{}")
-            product = (payload.get("product") or "").strip()
-            if not product:
-                return self._send(400, json.dumps({"error": "empty product"}))
-
-            # Hybrid demo runs both routes so the whole decision process is visible.
-            result_a, candidates = MAPPER.explain(product)
-            result_b, trace_b = PI_MAPPER.explain(product)
-            feedback = SYN_FEEDBACK.maybe_enqueue(product, candidates, MAPPER)
-
-            decision = choose_hybrid_final(product, result_a, result_b, MAPPER, use_llm=True)
-            a_ok = decision["a_ok"]
-            b_ok = decision["b_ok"]
-            extension = decision["extension"]
-            final = decision["final"]
-            saved = False
-            if extension:
-                try:
-                    append_extension_record(extension)
-                    extension["saved"] = True
-                    saved = True
-                except Exception as e:
-                    extension["saved"] = False
-                    extension["save_error"] = str(e)
-
-            flow_steps = [
-                {"title": "输入产品名", "desc": product, "status": "done"},
-                {
-                    "title": "Route A 判断",
-                    "desc": "可靠命中" if a_ok else ("弱命中/待复核" if result_a.get("node_id") else "未命中"),
-                    "status": "done" if a_ok else "warn",
-                },
-                {
-                    "title": "Route B 判断",
-                    "desc": "可靠命中" if b_ok else ("弱命中/待复核" if result_b.get("node_id") else "未命中"),
-                    "status": "done" if b_ok else "warn",
-                },
-            ]
-            if decision["conflict"]:
-                adj = decision["adjudication"]
-                flow_steps.append({
-                    "title": "A/B冲突仲裁",
-                    "desc": adj.get("reason") or adj.get("choice") or "已触发仲裁",
-                    "status": "done" if adj.get("status") == "done" else "warn",
-                })
-            flow_steps.append({
-                "title": "最终流向",
-                "desc": f"采用 {final['route']}" if final.get("node_id") else "进入体系扩展建议",
-                "status": "done" if final.get("node_id") else "stop",
-            })
-            body = json.dumps({
-                "route_a": {"result": result_a, "candidates": candidates, "reliable": a_ok},
-                "route_b": {"result": result_b, "trace": trace_b, "reliable": b_ok},
-                "final": final,
-                "extension": extension,
-                "conflict": decision["conflict"],
-                "adjudication": decision["adjudication"],
-                "flow_steps": flow_steps,
-                "extension_saved": saved,
-                "synonym_feedback": feedback,
-            }, ensure_ascii=False)
-            self._send(200, body)
-
-        elif self.path == "/api/synonym-feedback/approve":
-            n = int(self.headers.get("Content-Length", 0))
-            payload = json.loads(self.rfile.read(n) or b"{}")
-            task_id = (payload.get("task_id") or "").strip()
-            if not task_id:
-                return self._send(400, json.dumps({"error": "empty task_id"}))
-            body = SYN_FEEDBACK.approve(task_id, MAPPER)
-            self._send(200 if body.get("status") == "approved" else 400 if "error" in body else 200,
-                       json.dumps(body, ensure_ascii=False))
-
-        elif self.path == "/api/method":
-            n = int(self.headers.get("Content-Length", 0))
-            payload = json.loads(self.rfile.read(n) or b"{}")
-            method = (payload.get("method") or "").strip()
-            if method not in ("raga", "pageindex", "hybrid"):
-                return self._send(400, json.dumps({"error": "method must be raga, pageindex, or hybrid"}))
-            global CURRENT_METHOD
-            CURRENT_METHOD = method
-            self._send(200, json.dumps({"method": method}))
-
-        elif self.path == "/api/embedder":
-            n = int(self.headers.get("Content-Length", 0))
-            payload = json.loads(self.rfile.read(n) or b"{}")
-            emb = (payload.get("embedder") or "").strip()
-            if emb not in ("hash", "st"):
-                return self._send(400, json.dumps({"error": "embedder must be hash or st"}))
-            if emb == "st" and not st_available():
-                return self._send(400, json.dumps({"error": "sentence-transformers 未安装，无法使用 ST"}))
-            try:
-                dt = MAPPER.set_embedder(emb)
-                global CURRENT_EMBEDDER
-                CURRENT_EMBEDDER = emb
-                note = ""
-                if dt > 0.5:
-                    note = f"切换成功，重建向量索引耗时 {dt:.1f}s"
-                self._send(200, json.dumps({"embedder": emb, "note": note}))
-            except Exception as e:
-                self._send(500, json.dumps({"error": str(e)}))
-
-        elif self.path == "/api/batch/start":
-            n = int(self.headers.get("Content-Length", 0))
-            payload = json.loads(self.rfile.read(n) or b"{}")
-            filename = (payload.get("filename") or "input.xlsx").strip()
-            mode = (payload.get("mode") or "local").strip()
-            limit = int(payload.get("limit") or 200)
-            data_b64 = payload.get("data_base64") or ""
-            if mode not in {"local", "full", "sampled"}:
-                return self._send(400, json.dumps({"error": "mode must be local, full, or sampled"}))
-            if not filename.lower().endswith(".xlsx"):
-                return self._send(400, json.dumps({"error": "only .xlsx is supported"}))
-            if not data_b64:
-                return self._send(400, json.dumps({"error": "empty upload"}))
-            limit = max(1, min(limit, 5000))
-
-            job_id = uuid.uuid4().hex[:12]
-            job_dir = BATCH_DIR / job_id
-            job_dir.mkdir(parents=True, exist_ok=True)
-            input_path = job_dir / "input.xlsx"
-            result_path = job_dir / "result.xlsx"
-            try:
-                input_path.write_bytes(base64.b64decode(data_b64))
-            except Exception as e:
-                return self._send(400, json.dumps({"error": f"invalid file data: {e}"}))
-
-            job = BatchJob(job_id, input_path, result_path, mode, limit)
-            with BATCH_LOCK:
-                BATCH_JOBS[job_id] = job
-
-            def progress(updated_job):
-                with BATCH_LOCK:
-                    BATCH_JOBS[updated_job.job_id] = updated_job
-
-            thread = threading.Thread(
-                target=process_batch,
-                args=(job, MAPPER, PI_MAPPER, progress),
-                daemon=True,
-            )
-            thread.start()
-            self._send(200, json.dumps({"job_id": job_id}, ensure_ascii=False))
-        else:
-            self._send(404, json.dumps({"error": "not found"}))
-
-    def log_message(self, *args):
-        pass
-
-
-def main(port: int = 8000):
-    global MAPPER, PI_MAPPER, CURRENT_EMBEDDER, CURRENT_METHOD
-    print("\n正在构建索引…")
-
-    # Route A initialization
-    print("  [Route A] 加载 RAG 索引…")
-    MAPPER = ProductMapper()
-
-    # Route B initialization
-    print("  [Route B] 加载 PageIndex 树…")
-    PI_MAPPER = PageIndexMapper()
-
-    # Warmup ST model
-    if st_available():
-        try:
-            from .embedder import STEmbedder
-            st = STEmbedder()
-            texts = [n.embed_text() for n in MAPPER.nodes]
-            st_emb = st.encode(texts)
-            MAPPER.recaller._emb_cache['st'] = (st, st_emb)
-            print('  ST model warmed up with pre-computed embeddings')
-        except Exception as e:
-            print(f'  ST warmup failed (hash mode unaffected): {e}')
-
-    CURRENT_EMBEDDER = MAPPER.embedder_type
-    CURRENT_METHOD = "raga"
-    st_info = "可用" if st_available() else "未安装"
-
-    print(f"\n索引就绪：{len(MAPPER.nodes)} 节点")
-    print(f"  Route A (RAG):        Embedder={CURRENT_EMBEDDER}, LLM={'已启用' if config.has_llm() else '未启用'}")
-    print(f"  Route B (PageIndex):  LLM={'已启用' if config.has_llm() else '未启用'}, ST={st_info}")
-    print(f"  Hybrid:               A+B 双路线展示，双不可靠时触发体系扩展")
-
-    srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    print(f"\n打开浏览器访问：http://localhost:{port}   （Ctrl+C 停止）")
-    try:
-        srv.serve_forever()
-    except KeyboardInterrupt:
-        print("\n已停止。")
-
-
-if __name__ == "__main__":
-    main()
+</body></html>

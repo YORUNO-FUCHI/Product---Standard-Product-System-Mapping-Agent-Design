@@ -51,6 +51,57 @@ def hit(result: dict | None) -> bool:
     return bool(result and result.get("node_id") is not None)
 
 
+# ── 语义相似度：用独立缓存的 bge，避免受全局 embedder(可能是 hash)影响 ──
+_SEM_EMBEDDER = None
+_SEM_EMBEDDER_TRIED = False
+_SEM_NODE_VEC_CACHE: dict[int, Any] = {}   # node_id → 归一化向量（避免重复编码）
+_SEM_PRODUCT_VEC_CACHE: dict[str, Any] = {}
+
+
+def _get_sem_embedder():
+    """惰性加载一个专用 bge ST embedder；未安装 sentence-transformers 时返回 None。"""
+    global _SEM_EMBEDDER, _SEM_EMBEDDER_TRIED
+    if _SEM_EMBEDDER_TRIED:
+        return _SEM_EMBEDDER
+    _SEM_EMBEDDER_TRIED = True
+    try:
+        from .embedder import st_available, STEmbedder
+        _SEM_EMBEDDER = STEmbedder() if st_available() else None
+    except Exception:
+        _SEM_EMBEDDER = None
+    return _SEM_EMBEDDER
+
+
+def semantic_sim(mapper, product: str, result: dict | None) -> float:
+    """产品 ↔ 所选节点 的 bge 语义余弦，范围[-1,1]；不可用时返回 0.0。
+
+    结果会被写入 result['semantic_sim'] 供 route_b_reliable 读取，
+    从而把"字面重叠一票否决"替换为"语义为主、字面为辅"的多信号判定。
+    """
+    if not result or result.get("node_id") is None or not product:
+        return 0.0
+    emb = _get_sem_embedder()
+    if emb is None:
+        return 0.0
+    node_id = result.get("node_id")
+    node = mapper.by_id.get(node_id) if mapper is not None else None
+    node_text = node.search_text() if node is not None else (result.get("name") or "")
+    if not node_text:
+        return 0.0
+    try:
+        pv = _SEM_PRODUCT_VEC_CACHE.get(product)
+        if pv is None:
+            pv = emb.encode_one(product)
+            _SEM_PRODUCT_VEC_CACHE[product] = pv
+        nv = _SEM_NODE_VEC_CACHE.get(node_id)
+        if nv is None:
+            nv = emb.encode_one(node_text)
+            _SEM_NODE_VEC_CACHE[node_id] = nv
+        return float(pv @ nv)
+    except Exception:
+        return 0.0
+
+
 def route_a_reliable(result: dict | None) -> bool:
     if not hit(result):
         return False
@@ -64,17 +115,41 @@ def route_a_reliable(result: dict | None) -> bool:
 
 
 def route_b_reliable(result: dict | None) -> bool:
+    """Route B 可靠性判定（语义挡漂移 + 字面兜底，替代"字面重叠一票否决"）。
+
+    旧逻辑用"核心词字面不重叠 → 一票否决"，会误杀"字面不同但语义相同"的正确映射
+    （如 苞米→玉米、MateBook→微型计算机设备）。
+
+    标注集校准（cache/sem_calib_v2）表明：bge 绝对余弦无法区分"正确节点 vs 最相似
+    错节点"，但能很好区分"语义相关 vs 语义无关的漂移"（漂移背景余弦≈0.32，正确≈0.57）。
+    因此新逻辑不再用语义分"挑最优"，而是：
+      - 只要 (字面重叠 或 语义相关) 且 LLM 置信度不过低 → 采信 Route B 的树搜索选择；
+      - 字面无重叠 且 语义无关（真·漂移）→ 判不可靠（挡住 光伏板→发电机 类翻车，不回归旧 bug）。
+    语义分（result['semantic_sim']）由 semantic_sim() 在编排层预存。
+    """
     if not hit(result):
         return False
     source = result.get("source", "")
     confidence = float(result.get("confidence", 0.0) or 0.0)
-    if result.get("lexical_quality") == "noisy" or result.get("core_overlap") is False:
-        return source == "pageindex_exact"
-    if source in {"pageindex_exact", "hybrid_pageindex"} and confidence >= 0.85:
+
+    # 精确匹配始终可靠
+    if source == "pageindex_exact":
         return True
-    if source == "pageindex" and confidence >= 0.70:
+    if source == "hybrid_pageindex" and confidence >= 0.85:
         return True
-    return source == "pageindex_trigram" and confidence >= 0.18
+
+    # 支持信号：字面重叠 / 语义相关（非漂移）
+    lit_ok = result.get("core_overlap") is True
+    sem = float(result.get("semantic_sim", 0.0) or 0.0)
+    sem_related = sem >= config.SEM_SIM_THRESHOLD
+
+    if source == "pageindex":
+        # 非漂移（字面或语义任一支持）且置信度达标 → 采信 LLM 选择
+        return (lit_ok or sem_related) and confidence >= config.SEM_CONF_FLOOR
+    if source == "pageindex_trigram":
+        # 无 LLM 降级路径：字面分够 + (语义或字面)支持
+        return confidence >= 0.18 and (sem_related or lit_ok)
+    return False
 
 
 def status_label(result: dict | None, reliable: bool) -> str:

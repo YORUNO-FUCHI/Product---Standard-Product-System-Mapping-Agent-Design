@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 
 # 项目根目录（本文件的上上级）
 ROOT = Path(__file__).resolve().parent.parent
-load_dotenv(ROOT / ".env")
+load_dotenv(ROOT / ".env", encoding="utf-8")
 
 # ── 数据与缓存路径 ────────────────────────────────────────────────
 EXCEL_PATH = ROOT / "产品标准体系.xlsx"
@@ -39,6 +39,16 @@ LLM_PROXY = os.getenv("LLM_PROXY", "")
 
 # ── Postgres 连接（RECALL_BACKEND=pg 时使用）──────────────────────
 PG_DSN = os.getenv("PG_DSN", "postgresql://postgres:postgres@localhost:5432/taxonomy")
+
+# ── Route B 语义可靠性门槛（用 bge 语义分替代"字面重叠一票否决"）──────────
+# SEM_SIM_THRESHOLD：产品↔所选节点的 bge 余弦 ≥ 此值即视为"语义相关（非漂移）"。
+#   由标注集校准得到（见 cache/sem_calib_v2.*）：0.43 时挡住约 98.5% 的语义无关漂移，
+#   同时放行约 81% 的正确映射；其余正确映射由"字面重叠"信号兜底。
+# SEM_CONF_FLOOR   ：有(字面或语义)支持信号时，允许的最低 LLM 置信度。
+# 说明：校准显示绝对余弦无法区分"正确节点 vs 最相似错节点"，故语义分只用于"挡漂移"，
+#   不作为"单独采信"的强证据。可用 .env 覆盖。
+SEM_SIM_THRESHOLD = float(os.getenv("SEM_SIM_THRESHOLD", "0.43"))
+SEM_CONF_FLOOR = float(os.getenv("SEM_CONF_FLOOR", "0.60"))
 
 # ── 同义词反馈环：pgvector 高相似 + pg_trgm 零字面 → LLM 判断 → 人工确认写回 ──
 SYN_FEEDBACK_ENABLED = os.getenv("SYN_FEEDBACK_ENABLED", "true").lower() in {"1", "true", "yes", "on"}

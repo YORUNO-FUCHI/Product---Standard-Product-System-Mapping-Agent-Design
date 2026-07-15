@@ -13,6 +13,7 @@ from .extension import (
     append_extension_record,
     route_a_reliable,
     route_b_reliable,
+    semantic_sim,
 )
 from .hybrid_decider import choose_hybrid_final
 
@@ -170,6 +171,7 @@ def process_batch(job: BatchJob, mapper, pageindex_mapper,
 
                 result_a, _candidates = mapper.explain(product)
                 result_b, _trace = pageindex_mapper.explain(product)
+                result_b["semantic_sim"] = semantic_sim(mapper, product, result_b)
                 a_ok = route_a_reliable(result_a)
                 b_ok = route_b_reliable(result_b)
 
@@ -178,6 +180,7 @@ def process_batch(job: BatchJob, mapper, pageindex_mapper,
                     config.DEEPSEEK_API_KEY = original_key
                     result_a, _candidates = mapper.explain(product)
                     result_b, _trace = pageindex_mapper.explain(product)
+                    result_b["semantic_sim"] = semantic_sim(mapper, product, result_b)
                     a_ok = route_a_reliable(result_a)
                     b_ok = route_b_reliable(result_b)
                     use_llm = bool(original_key)
